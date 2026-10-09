@@ -418,6 +418,15 @@ impl Bin {
         }
         self.children.iter_mut().any(|c| if let BinEntry::Bin(b) = c { b.remove_item(id) } else { false })
     }
+    /// Take a sub-bin, and everything in it, out of the tree. The bin itself is never removed from itself.
+    pub fn remove_bin(&mut self, id: BinId) -> Option<Bin> {
+        if let Some(at) = self.children.iter().position(|c| matches!(c, BinEntry::Bin(b) if b.id == id))
+            && let BinEntry::Bin(b) = self.children.remove(at)
+        {
+            return Some(b);
+        }
+        self.children.iter_mut().find_map(|c| if let BinEntry::Bin(b) = c { b.remove_bin(id) } else { None })
+    }
     /// All items in this bin and sub-bins.
     pub fn all_items(&self, out: &mut Vec<ItemId>) {
         for c in &self.children {
@@ -777,6 +786,8 @@ impl Track {
     }
     /// Invariant check: items do not overlap.
     pub fn check(&self) -> Result<(), String> {
+        // Validate before calling end(), including on a single-item track.
+        self.check_bounds()?;
         for w in self.items.windows(2) {
             if w[0].end() > w[1].start {
                 return Err(format!("{}: items {:?} and {:?} overlap", self.name, w[0].id, w[1].id));
@@ -785,6 +796,21 @@ impl Track {
         for i in &self.items {
             if i.duration.0 <= 0 {
                 return Err(format!("{}: item {:?} has non-positive duration", self.name, i.id));
+            }
+        }
+        Ok(())
+    }
+    /// Only the value bounds that keep timeline arithmetic from overflowing (no structural rules
+    /// such as overlap or positive duration); what a loaded project must satisfy.
+    pub fn check_bounds(&self) -> Result<(), String> {
+        for item in &self.items {
+            if !bounded_time_range(item.start, item.duration) {
+                return Err(format!("{}: item {:?} is outside supported time bounds", self.name, item.id));
+            }
+        }
+        for transition in &self.transitions {
+            if !bounded_time_range(transition.start, transition.duration) {
+                return Err(format!("{}: transition {:?} is outside supported time bounds", self.name, transition.id));
             }
         }
         Ok(())
@@ -835,6 +861,41 @@ impl Default for SequenceSettings {
             working_space: "Rec. 709".into(),
             color: filmcraft_color::ColorPipeline::REC709,
         }
+    }
+}
+
+/// Largest frame side, in pixels.
+pub const MAX_FRAME_SIDE: u32 = 32_768;
+/// Largest frame area, in pixels (16384 x 16384: 16K and 16384 x 8192 panoramas fit).
+pub const MAX_FRAME_PIXELS: u64 = 268_435_456;
+
+/// Bound working-frame allocations while retaining 16K and wide panoramic frames.
+pub fn validate_frame_size(width: u32, height: u32) -> Result<(), String> {
+    if width == 0 || height == 0 || width > MAX_FRAME_SIDE || height > MAX_FRAME_SIDE || u64::from(width) * u64::from(height) > MAX_FRAME_PIXELS {
+        return Err(format!("frame size must be positive, at most {MAX_FRAME_SIDE} pixels per side and {MAX_FRAME_PIXELS} pixels total"));
+    }
+    Ok(())
+}
+
+impl SequenceSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_frame_size(self.width, self.height)?;
+        if self.frame_rate.num <= 0
+            || self.frame_rate.den <= 0
+            || self.frame_rate.as_f64() > 1000.0
+            || self.frame_rate.num > i64::from(u32::MAX)
+            || self.frame_rate.den > i64::from(u32::MAX)
+            || (i128::from(TICKS_PER_SECOND) * i128::from(self.frame_rate.den) / i128::from(self.frame_rate.num.max(1))) > i128::from(Tick::MAX.0)
+        {
+            return Err("frame rate must be positive, at most 1000 fps, with unsigned 32-bit rational components".into());
+        }
+        if self.sample_rate == 0 || self.sample_rate > 384_000 {
+            return Err("sample rate must be between 1 and 384000 Hz".into());
+        }
+        if self.par.0 == 0 || self.par.1 == 0 {
+            return Err("pixel aspect ratio must be positive".into());
+        }
+        Ok(())
     }
 }
 
@@ -967,6 +1028,7 @@ impl Sequence {
         v
     }
     pub fn check(&self) -> Result<(), String> {
+        self.check_bounds()?;
         for t in self.all_tracks() {
             t.check()?;
         }
@@ -975,6 +1037,33 @@ impl Sequence {
         }
         Ok(())
     }
+    /// The hostile-value bounds alone (settings, marks and every time range), without the
+    /// structural invariants of [`Sequence::check`]: a project that breaks only those (e.g. an
+    /// overlap written by an older build) still opens, but nothing in it can overflow.
+    pub fn check_bounds(&self) -> Result<(), String> {
+        self.settings.validate()?;
+        if self.mark_in.into_iter().chain(self.mark_out).any(|t| t < Tick::MIN || t > Tick::MAX)
+            || self.work_area.is_some_and(|r| !bounded_time_range(r.start, r.duration))
+        {
+            return Err("sequence marks or work area are outside supported time bounds".into());
+        }
+        for t in self.all_tracks() {
+            t.check_bounds()?;
+        }
+        for t in &self.caption_tracks {
+            t.check_bounds()?;
+        }
+        Ok(())
+    }
+}
+
+/// Bound persisted timeline arithmetic before any start + duration operation: start, duration and
+/// end all stay within `Tick::MIN..=Tick::MAX`, leaving headroom for later edit math. Negative
+/// positions remain supported; the sign of the duration is a structural rule (track items and
+/// captions require a positive one in their own invariant checks), not a bound.
+pub(crate) fn bounded_time_range(start: Tick, duration: Tick) -> bool {
+    let within = |t: i64| (Tick::MIN.0..=Tick::MAX.0).contains(&t);
+    within(start.0) && within(duration.0) && start.0.checked_add(duration.0).is_some_and(within)
 }
 
 /// Project-level settings.
@@ -1100,6 +1189,55 @@ pub struct Project {
     pub source_graphics: BTreeMap<ItemId, SourceGraphic>,
 }
 
+/// How a sequence is shown in the Timeline panel: its zoom, scroll position and track heights.
+/// Each open sequence keeps its own (as Premiere's sequence tabs do).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SequenceView {
+    /// Zoom: points per second.
+    pub pps: f64,
+    /// Time at the left edge, in seconds.
+    pub scroll: f64,
+    /// Vertical scroll of the video and audio halves, in points.
+    #[serde(default)]
+    pub v_scroll: f32,
+    #[serde(default)]
+    pub a_scroll: f32,
+    pub video_track_h: f32,
+    pub audio_track_h: f32,
+}
+
+impl SequenceView {
+    /// The view with every number brought into a usable range, or `None` when a number is not
+    /// finite. Views are read from project files, so nothing in them is trusted.
+    pub fn checked(self) -> Option<SequenceView> {
+        let all = [self.pps, self.scroll, self.v_scroll as f64, self.a_scroll as f64, self.video_track_h as f64, self.audio_track_h as f64];
+        if all.iter().any(|x| !x.is_finite()) {
+            return None;
+        }
+        Some(SequenceView {
+            pps: self.pps.clamp(1e-3, 1e5),
+            scroll: self.scroll.clamp(0.0, 1e7),
+            v_scroll: self.v_scroll.clamp(0.0, 1e6),
+            a_scroll: self.a_scroll.clamp(0.0, 1e6),
+            video_track_h: self.video_track_h.clamp(8.0, 600.0),
+            audio_track_h: self.audio_track_h.clamp(8.0, 600.0),
+        })
+    }
+}
+
+/// What was open when a project was saved: the Timeline's sequence tabs in order, the active one
+/// and how each sequence was shown. Stored beside the project in its file, not in it: it is not
+/// part of the edit and never an undo step.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProjectView {
+    #[serde(default)]
+    pub open_sequences: Vec<ItemId>,
+    #[serde(default)]
+    pub active_sequence: Option<ItemId>,
+    #[serde(default)]
+    pub sequences: BTreeMap<ItemId, SequenceView>,
+}
+
 /// A LUT imported into the project (`lut.import`). Lumetri refers to it as `lib:<id>`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectLut {
@@ -1196,6 +1334,75 @@ impl Project {
     }
     pub fn sequences(&self) -> impl Iterator<Item = &ProjectItem> {
         self.items.values().filter(|i| matches!(i.kind, ItemKind::Sequence(_)))
+    }
+
+    /// The part of a nested-sequence clip's timeline range that lies past the end of the nested
+    /// sequence's contents: it shows nothing and is silent, and the Timeline hatches it. A nest
+    /// keeps its length when its sequence gets shorter, so this is what is left to trim off.
+    /// `None` for other clips and for nests that end within their contents.
+    pub fn nest_overhang(&self, clip: &TrackItem) -> Option<TimeRange> {
+        let contents = self.sequence(clip.item)?.duration();
+        if let Some(held) = clip.frame_hold {
+            return (held >= contents).then(|| clip.range());
+        }
+        let past = clip.source_out() - contents;
+        if past <= Tick::ZERO {
+            return None;
+        }
+        let speed = clip.speed.abs();
+        if clip.source_in >= contents || !speed.is_finite() || speed < 1e-9 {
+            return Some(clip.range());
+        }
+        // source time past the contents, as timeline time
+        let len = Tick(((past.0 as f64 / speed).round() as i64).clamp(0, clip.duration.0.max(0)));
+        if len <= Tick::ZERO {
+            return None;
+        }
+        // a reversed clip plays its source's end first
+        Some(if clip.reverse { TimeRange::new(clip.start, len) } else { TimeRange::new(clip.end() - len, len) })
+    }
+
+    /// A sequence that contains itself, directly or through the sequences nested in it (the lowest
+    /// id of those on a cycle), or `None` when nesting is sound. Such a sequence has no frame to
+    /// show, so edits that would make one are refused; only a damaged project file holds one.
+    pub fn nest_cycle(&self) -> Option<ItemId> {
+        // each sequence's nested sequences
+        let mut nests: BTreeMap<ItemId, Vec<ItemId>> = BTreeMap::new();
+        for it in self.items.values() {
+            let ItemKind::Sequence(q) = &it.kind else { continue };
+            let mut inner: Vec<ItemId> = q.all_tracks().flat_map(|t| t.items.iter().map(|i| i.item)).filter(|i| self.sequence(*i).is_some()).collect();
+            inner.sort_unstable();
+            inner.dedup();
+            if !inner.is_empty() {
+                nests.insert(it.id, inner);
+            }
+        }
+        // drop sequences whose nests all lead out of the set, until none can be dropped: what is
+        // left lies on a cycle or leads into one
+        loop {
+            let leaves: Vec<ItemId> = nests.iter().filter(|(_, inner)| inner.iter().all(|i| !nests.contains_key(i))).map(|(id, _)| *id).collect();
+            if leaves.is_empty() {
+                break;
+            }
+            for id in leaves {
+                nests.remove(&id);
+            }
+        }
+        // of those, the ones that can reach themselves
+        nests.keys().copied().find(|start| {
+            let mut seen: Vec<ItemId> = Vec::new();
+            let mut todo: Vec<ItemId> = nests.get(start).cloned().unwrap_or_default();
+            while let Some(id) = todo.pop() {
+                if id == *start {
+                    return true;
+                }
+                if !seen.contains(&id) {
+                    seen.push(id);
+                    todo.extend(nests.get(&id).into_iter().flatten().copied());
+                }
+            }
+            false
+        })
     }
 
     /// Create an empty sequence with `v` video and `a` audio tracks.
@@ -1335,9 +1542,15 @@ impl Project {
 
 /// Resolve NaN "auto" point defaults (frame centre / source centre) in an effect instance.
 pub fn resolve_auto_points(e: &mut EffectInstance, frame: (u32, u32), source: (u32, u32)) {
+    resolve_auto_points_sized(e, frame, Some(source));
+}
+
+/// [`resolve_auto_points`] for a source whose size may not be known yet (`None`): the points
+/// measured in the source (`anchor`) then stay "auto".
+fn resolve_auto_points_sized(e: &mut EffectInstance, frame: (u32, u32), source: Option<(u32, u32)>) {
     for (k, p) in e.params.iter_mut() {
         if let ParamValue::Vec2(v) = &mut p.value {
-            let (w, h) = if k == "anchor" { source } else { frame };
+            let Some((w, h)) = (if k == "anchor" { source } else { Some(frame) }) else { continue };
             if let Some((fx, fy)) = effect::auto_point(&e.effect, k) {
                 if v.x.is_nan() {
                     v.x = w as f64 * fx;
@@ -1355,6 +1568,97 @@ pub fn resolve_auto_points(e: &mut EffectInstance, frame: (u32, u32), source: (u
         }
     }
     let _ = Vec2::ZERO;
+}
+
+impl Project {
+    /// Resolve media through at most sixteen items, preserving the outermost subclip range.
+    /// Missing parents, cycles and longer chains are unavailable media.
+    pub fn resolve_media(&self, item: ItemId) -> Option<(ItemId, &MediaClip, Option<TimeRange>)> {
+        let mut id = item;
+        let mut range = None;
+        for _ in 0..16 {
+            match &self.item(id)?.kind {
+                ItemKind::Media(media) => return Some((id, media, range)),
+                ItemKind::Subclip { parent, range: span, .. } => {
+                    range.get_or_insert(*span);
+                    id = *parent;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Size in pixels of what an item shows: a media clip's picture, a sequence's frame, an
+    /// adjustment layer or graphic; a subclip has the size of its parent. `None` without
+    /// picture. This is the size the renderer centres a clip's "auto" anchor in.
+    pub fn source_size(&self, item: ItemId) -> Option<(u32, u32)> {
+        let mut id = item;
+        // subclips of subclips: bounded, a damaged project could point a subclip at itself
+        for _ in 0..16 {
+            return match &self.item(id)?.kind {
+                ItemKind::Media(m) => m.info.video.as_ref().map(|v| (v.width, v.height)),
+                ItemKind::Sequence(q) => Some((q.settings.width, q.settings.height)),
+                ItemKind::AdjustmentLayer { width, height, .. } | ItemKind::Graphic { width, height, .. } => Some((*width, *height)),
+                ItemKind::Subclip { parent, .. } => {
+                    id = *parent;
+                    continue;
+                }
+            };
+        }
+        None
+    }
+
+    /// Resolve the "auto" (NaN) points of the clips in the sequences `sequences` selects, for
+    /// clips that did not go through a placing command (an interchange import builds them with
+    /// the effect defaults). Points measured in the frame use the sequence's size. `anchor` is
+    /// measured in the clip's source ([`Project::source_size`], a subclip through its parent) and
+    /// is resolved only when `size_is_final` says so for that source item (the media item for a
+    /// subclip); otherwise it stays "auto", which the renderer centres in whatever size the media
+    /// turns out to have. Points that are not NaN are never touched, so this can run again when
+    /// more sizes are known.
+    pub fn resolve_placed_auto_points(&mut self, sequences: impl Fn(ItemId) -> bool, size_is_final: impl Fn(&ProjectItem) -> bool) {
+        let seq_ids: Vec<ItemId> = self.items.values().filter(|i| matches!(i.kind, ItemKind::Sequence(_)) && sequences(i.id)).map(|i| i.id).collect();
+        for seq_id in seq_ids {
+            let Some(seq) = self.sequence(seq_id) else { continue };
+            // the source size of each clip that has an unresolved point, looked up before the edit
+            let sources: BTreeMap<ClipId, Option<(u32, u32)>> = seq
+                .all_tracks()
+                .flat_map(|t| t.items.iter())
+                .filter(|c| c.effects.iter().any(has_auto_point))
+                .map(|c| (c.id, self.final_source_size(c.item, &size_is_final)))
+                .collect();
+            if sources.is_empty() {
+                continue;
+            }
+            let Some(seq) = self.sequence_mut(seq_id) else { continue };
+            let frame = (seq.settings.width, seq.settings.height);
+            for clip in seq.all_tracks_mut().flat_map(|t| t.items.iter_mut()) {
+                let Some(source) = sources.get(&clip.id) else { continue };
+                for e in &mut clip.effects {
+                    resolve_auto_points_sized(e, frame, *source);
+                }
+            }
+        }
+    }
+
+    /// [`Project::source_size`] of `item` when the item that carries the size (the media item of
+    /// a subclip) passes `size_is_final`.
+    fn final_source_size(&self, item: ItemId, size_is_final: &impl Fn(&ProjectItem) -> bool) -> Option<(u32, u32)> {
+        let mut id = item;
+        for _ in 0..16 {
+            let it = self.item(id)?;
+            match &it.kind {
+                ItemKind::Subclip { parent, .. } => id = *parent,
+                _ => return if size_is_final(it) { self.source_size(id) } else { None },
+            }
+        }
+        None
+    }
+}
+
+fn has_auto_point(e: &EffectInstance) -> bool {
+    e.params.values().any(|p| matches!(&p.value, ParamValue::Vec2(v) if v.x.is_nan() || v.y.is_nan()))
 }
 
 #[cfg(test)]
@@ -1399,6 +1703,128 @@ mod tests {
         let q = Project::from_json(&s).unwrap();
         assert_eq!(p, q);
         assert!(q.sequence(seq).unwrap().check().is_ok());
+    }
+
+    #[test]
+    fn hostile_frame_rates_are_rejected_before_frame_arithmetic() {
+        for frame_rate in [FrameRate { num: i64::MAX, den: i64::MAX }, FrameRate { num: 1, den: i64::from(u32::MAX) }] {
+            let settings = SequenceSettings { frame_rate, ..Default::default() };
+            assert!(settings.validate().is_err());
+        }
+        for (width, height) in [(7680, 4320), (15360, 8640), (16384, 8192), (16384, 16384), (32768, 8192)] {
+            assert!(SequenceSettings { width, height, ..Default::default() }.validate().is_ok(), "{width}x{height}");
+        }
+        assert!(validate_frame_size(32768, 16384).is_err());
+        assert!(validate_frame_size(65536, 1).is_err());
+    }
+
+    #[test]
+    fn corrupt_timeline_times_are_rejected_before_end_arithmetic() {
+        let (mut project, media, seq) = demo_project();
+        let rate = project.sequence(seq).unwrap().settings.frame_rate;
+        let range = TimeRange::new(Tick::ZERO, rate.tick_of(24));
+        let first = project.make_track_item(media, TrackKind::Video, Tick::ZERO, range, rate).unwrap();
+        let second = project.make_track_item(media, TrackKind::Video, rate.tick_of(24), range, rate).unwrap();
+        project.sequence_mut(seq).unwrap().video_tracks[0].items = vec![first, second];
+        for start in [Tick(i64::MAX), Tick(i64::MIN), Tick::MAX] {
+            project.sequence_mut(seq).unwrap().video_tracks[0].items[0].start = start;
+            let result = std::panic::catch_unwind(|| project.sequence(seq).unwrap().check());
+            assert!(result.is_ok());
+            assert!(result.unwrap().is_err());
+        }
+        project.sequence_mut(seq).unwrap().video_tracks[0].items[0].start = Tick::ZERO;
+        for mark in [Tick(i64::MAX), Tick(i64::MIN)] {
+            project.sequence_mut(seq).unwrap().mark_out = Some(mark);
+            assert!(project.sequence(seq).unwrap().check().is_err());
+        }
+    }
+
+    #[test]
+    fn point_params_keep_auto_through_json_and_no_other_point_reads_null() {
+        // serde_json writes NaN as `null`; a point parameter reads it back as NaN ("auto")
+        let json = serde_json::to_string(&ParamValue::Vec2(Vec2::new(f64::NAN, 540.0))).unwrap();
+        assert_eq!(json, r#"{"Vec2":{"x":null,"y":540.0}}"#);
+        let v = serde_json::from_str::<ParamValue>(&json).unwrap().as_vec2().unwrap();
+        assert!(v.x.is_nan() && v.y == 540.0);
+        let both = serde_json::from_str::<ParamValue>(r#"{"Vec2":{"x":null,"y":null}}"#).unwrap().as_vec2().unwrap();
+        assert!(both.x.is_nan() && both.y.is_nan());
+        assert_eq!(serde_json::from_str::<ParamValue>(r#"{"Vec2":{"x":1.5,"y":-2}}"#).unwrap(), ParamValue::Vec2(Vec2::new(1.5, -2.0)));
+        // anything else is still an error, and so is a missing coordinate
+        for bad in [r#"{"Vec2":{"x":"a","y":0}}"#, r#"{"Vec2":{"x":0}}"#, r#"{"Vec2":null}"#, r#"{"Float":null}"#] {
+            assert!(serde_json::from_str::<ParamValue>(bad).is_err(), "{bad}");
+        }
+        // only point parameters: a `null` coordinate in a mask vertex (or any other point) is damage
+        assert!(serde_json::from_str::<Vec2>(r#"{"x":null,"y":0}"#).is_err());
+        let mut path = serde_json::to_value(MaskPath::ellipse(Vec2::new(100.0, 100.0), Vec2::new(50.0, 40.0))).unwrap();
+        assert!(serde_json::from_value::<MaskPath>(path.clone()).is_ok());
+        path["vertices"][0]["p"]["x"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<MaskPath>(path.clone()).is_err());
+        assert!(serde_json::from_value::<ParamValue>(serde_json::json!({ "Path": path })).is_err());
+    }
+
+    #[test]
+    fn media_resolution_bounds_depth_and_preserves_the_outer_range() {
+        let (mut p, media, _) = demo_project();
+        assert_eq!(p.resolve_media(media).map(|(id, _, range)| (id, range)), Some((media, None)));
+        let mut parent = media;
+        let mut last_range = TimeRange::default();
+        for n in 0..15 {
+            last_range = TimeRange::new(Tick(n * 1000), Tick(100));
+            parent = p.add_item("Sub", Label::Iris, ItemKind::Subclip { parent, range: last_range, restrict_trims: false }, None);
+        }
+        assert_eq!(p.resolve_media(parent).map(|(id, _, range)| (id, range)), Some((media, Some(last_range))));
+        let too_deep = p.add_item("Too deep", Label::Iris, ItemKind::Subclip { parent, range: last_range, restrict_trims: false }, None);
+        assert!(p.resolve_media(too_deep).is_none());
+        assert!(p.resolve_media(ItemId(u64::MAX)).is_none());
+    }
+
+    #[test]
+    fn placed_auto_points_resolve_once_the_source_size_is_final() {
+        let (mut p, clip, seq) = demo_project();
+        let src = p.item(clip).and_then(|i| i.as_media()).and_then(|m| m.info.video.clone()).unwrap();
+        let rate = p.sequence(seq).unwrap().settings.frame_rate;
+        let second = TimeRange::new(Tick::ZERO, Tick(TICKS_PER_SECOND));
+        let sub = p.add_item("Sub", Label::Iris, ItemKind::Subclip { parent: clip, range: second, restrict_trims: true }, None);
+        let sub_of_sub = p.add_item("Sub 2", Label::Iris, ItemKind::Subclip { parent: sub, range: second, restrict_trims: true }, None);
+        assert_eq!(p.source_size(clip), Some((src.width, src.height)));
+        assert_eq!((p.source_size(sub), p.source_size(sub_of_sub)), (p.source_size(clip), p.source_size(clip)), "a subclip has its parent's size");
+        assert_eq!(p.source_size(ItemId(987_654_321)), None);
+        // clips whose Motion position / anchor were never resolved (as an interchange import builds them)
+        let mut ids = Vec::new();
+        for (n, item) in [clip, sub, sub_of_sub].into_iter().enumerate() {
+            let ti = p.make_track_item(item, TrackKind::Video, Tick(n as i64 * TICKS_PER_SECOND), second, rate).unwrap();
+            assert!(ti.effect("motion").unwrap().vec2_at("position", Tick::ZERO).x.is_nan());
+            ids.push(ti.id);
+            p.sequence_mut(seq).unwrap().video_tracks[0].items.push(ti);
+        }
+        let st = p.sequence(seq).unwrap().settings.clone();
+        let point = |p: &Project, id: ClipId, k: &str| p.sequence(seq).unwrap().find_item(id).unwrap().1.effect("motion").unwrap().vec2_at(k, Tick::ZERO);
+        let (frame_centre, source_centre) =
+            (Vec2::new(st.width as f64 / 2.0, st.height as f64 / 2.0), Vec2::new(src.width as f64 / 2.0, src.height as f64 / 2.0));
+        // sequences that are not selected are left alone
+        let mut untouched = p.clone();
+        untouched.resolve_placed_auto_points(|_| false, |_| true);
+        assert!(point(&untouched, ids[0], "position").x.is_nan());
+        // the source size is not final yet: the frame's points resolve, the anchor stays auto
+        p.resolve_placed_auto_points(|_| true, |_| false);
+        for id in &ids {
+            assert_eq!(point(&p, *id, "position"), frame_centre);
+            assert!(point(&p, *id, "anchor").x.is_nan() && point(&p, *id, "anchor").y.is_nan());
+        }
+        // ...and survives a save: NaN is written as `null` and read back as NaN
+        let mut q = Project::from_json(&p.to_json()).unwrap();
+        assert!(point(&q, ids[0], "anchor").x.is_nan());
+        assert_eq!(q.to_json(), p.to_json());
+        // final for the media item only: its clip and the clips of its subclips get the source centre
+        q.resolve_placed_auto_points(|_| true, |i| i.id == clip);
+        for id in &ids {
+            assert_eq!((point(&q, *id, "position"), point(&q, *id, "anchor")), (frame_centre, source_centre));
+        }
+        assert!(!q.to_json().contains("null}}"), "no NaN point is left to write");
+        // running it again changes nothing
+        let once = q.clone();
+        q.resolve_placed_auto_points(|_| true, |_| true);
+        assert_eq!(q, once);
     }
 
     #[test]
@@ -1457,5 +1883,71 @@ mod tests {
         assert_eq!(p.root.parent_of(i), Some(b));
         assert!(p.root.remove_item(i));
         assert_eq!(p.root.parent_of(i), None);
+    }
+
+    #[test]
+    fn nest_cycle_finds_sequences_that_contain_themselves() {
+        let (mut p, clip, a) = demo_project();
+        let rate = p.sequence(a).unwrap().settings.frame_rate;
+        let b = p.new_sequence("b", SequenceSettings::default(), 1, 1, None);
+        let c = p.new_sequence("c", SequenceSettings::default(), 1, 1, None);
+        let put = |p: &mut Project, outer: ItemId, inner: ItemId| {
+            let it = p.make_track_item(inner, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, rate.tick_of(10)), rate).unwrap();
+            let id = it.id;
+            p.sequence_mut(outer).unwrap().video_tracks[0].items.push(it);
+            id
+        };
+        // media and a chain of nests (a in b in c, a twice in c) are sound
+        put(&mut p, a, clip);
+        put(&mut p, b, a);
+        put(&mut p, c, b);
+        put(&mut p, c, a);
+        assert_eq!(p.nest_cycle(), None);
+        // c inside a closes the loop a → c → b → a
+        let closing = put(&mut p, a, c);
+        assert_eq!(p.nest_cycle(), Some(a));
+        p.sequence_mut(a).unwrap().video_tracks[0].items.retain(|i| i.id != closing);
+        assert_eq!(p.nest_cycle(), None);
+        // a sequence directly inside itself; one that only leads into the loop is not reported
+        put(&mut p, c, c);
+        let d = p.new_sequence("d", SequenceSettings::default(), 1, 1, None);
+        put(&mut p, d, c);
+        assert_eq!(p.nest_cycle(), Some(c));
+    }
+
+    #[test]
+    fn nest_overhang_is_the_part_past_the_contents() {
+        let (mut p, clip, a) = demo_project();
+        let rate = p.sequence(a).unwrap().settings.frame_rate;
+        let f = |n: i64| rate.tick_of(n);
+        // a holds 100 frames of media; b nests a for 150 frames starting at frame 10
+        let media = p.make_track_item(clip, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, f(100)), rate).unwrap();
+        assert_eq!(p.nest_overhang(&media), None, "not a nest");
+        p.sequence_mut(a).unwrap().video_tracks[0].items.push(media);
+        let mut nest = p.make_track_item(a, TrackKind::Video, f(10), TimeRange::new(Tick::ZERO, f(150)), rate).unwrap();
+        assert_eq!(p.nest_overhang(&nest), Some(TimeRange::new(f(110), f(50))));
+        // within the contents, or exactly to their end: none
+        nest.duration = f(100);
+        assert_eq!(p.nest_overhang(&nest), None);
+        // trimmed in: 60 frames of contents are left
+        nest.source_in = f(40);
+        assert_eq!(p.nest_overhang(&nest), Some(TimeRange::new(f(70), f(40))));
+        // starting past the end: all of it
+        nest.source_in = f(100);
+        assert_eq!(p.nest_overhang(&nest), Some(nest.range()));
+        // double speed uses the contents up twice as fast
+        nest.source_in = Tick::ZERO;
+        nest.speed = 2.0;
+        assert_eq!(p.nest_overhang(&nest), Some(TimeRange::new(f(60), f(50))));
+        // reversed, the empty part comes first
+        nest.reverse = true;
+        assert_eq!(p.nest_overhang(&nest), Some(TimeRange::new(f(10), f(50))));
+        // a frame hold shows one frame throughout
+        nest.reverse = false;
+        nest.speed = 1.0;
+        nest.frame_hold = Some(f(20));
+        assert_eq!(p.nest_overhang(&nest), None);
+        nest.frame_hold = Some(f(100));
+        assert_eq!(p.nest_overhang(&nest), Some(nest.range()));
     }
 }

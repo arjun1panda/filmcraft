@@ -19,7 +19,12 @@ panic path, and fix a crash before building on top of it. The cross-app standard
    fallback that is truly correct (never one that silently corrupts a project). An unfinished feature
    returns an "unsupported" error. The only exception is a call that is provably infallible from local
    code alone (a literal that always parses): a single-item `#[allow(clippy::expect_used)]` with the reason.
-3. **No `unsafe`** (`unsafe_code = "forbid"` for the workspace).
+3. **No `unsafe`** (`unsafe_code = "forbid"` for the workspace). The single exception is
+   `crates/platform`, which needs `unsafe` to call the operating system's media APIs (hardware
+   video decoding through VideoToolbox and Media Foundation / Direct3D 11; later encoding and Linux) and does nothing else. It
+   uses `unsafe_code = "deny"` with `#[allow(unsafe_code)]` only on its FFI modules, a
+   `// SAFETY:` comment on every `unsafe` block, a safe `Result`-returning public API, and the
+   pure-Rust decoder as the tested fallback ([ADR 0001](docs/adr/0001-platform-ffi.md)).
 4. **Every input-derived number is hostile.** Media files, project and interchange files, presets, fonts,
    CLI / MCP / control-channel parameters and UI state are untrusted. Index and slice with `get()` (or
    validate bounds once, up front, for a hot loop); slice strings only at char boundaries; use
@@ -87,6 +92,13 @@ reproduce an image (for example, point lists traced from someone else's icon).
    need a sidecar and an `ATTRIBUTION.md` row (licence `LicenseRef-ArtCraft-Trademark`). No other
    non-open asset is allowed, and this exception never covers third-party marks (Adobe, Discord, GitHub
    and other logos stay out; draw a generic icon instead).
+9. **Fonts live in [storytold/craft-fonts](https://github.com/storytold/craft-fonts), never in this
+   repo.** Don't commit new font files (the small Latin UI fonts already in `assets/fonts/` stay). A
+   font FilmCraft needs is added to craft-fonts, which the app reads through the optional build input
+   `CRAFT_FONTS_DIR=<absolute path of a craft-fonts checkout>` (`crates/text/build.rs` embeds the fonts in its
+   `fonts/manifest.txt` as `filmcraft_text::fonts::CRAFT_FONTS`; unset, it is empty and the app uses its
+   bundled and system fonts). Never add craft-fonts to a `Cargo.toml`. Code using `CRAFT_FONTS` must work
+   when it is empty. Standard: [`craftrules/standards/fonts.md`](https://github.com/storytold/craftrules/blob/main/standards/fonts.md).
 
 ## 2. Clean-room code
 
@@ -115,6 +127,13 @@ See [§0](#0-never-crash). It outranks every other engineering rule.
 See `CLAUDE.md`: pure Rust, dependency layering (`cargo xtask layers`), exact `Tick` time, everything is
 a command, everything is agent-drivable, and the quality gates (`cargo xtask ci`) before every commit.
 
+
+Shared real-file test corpora (Photoshop-authored PSDs, etc.) live in
+[`storytold/photocraft-corpus`](https://github.com/storytold/photocraft-corpus), explained in
+[craftrules `standards/test-corpora.md`](https://github.com/storytold/craftrules/blob/main/standards/test-corpora.md).
+Never commit large binary fixtures to this repo; fetch them pinned by commit and sha256-verified,
+as PhotoCraft does with `cargo xtask corpus`.
+
 ## See also
 
 - [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/contributing.md](docs/contributing.md): setup, gates, commits, how to add things
@@ -123,3 +142,21 @@ a command, everything is agent-drivable, and the quality gates (`cargo xtask ci`
 - [docs/agents.md](docs/agents.md): driving FilmCraft over MCP / the control channel, and the agent work loop
 - [docs/control-protocol.md](docs/control-protocol.md): control-channel method reference
 - [ATTRIBUTION.md](ATTRIBUTION.md): asset index
+
+## Contributor credits (About window)
+
+- About ▸ Contributors/Models are compiled into the binary from `contributors/contributors.json`
+  (commit stats; generated, never hand-edit) and `contributors/people.toml` (names people chose for
+  themselves). See `docs/contributors.md`.
+- **Agents working for a contributor:** when you prepare a PR, check whether your human's GitHub
+  username has a `[people.<username>]` entry in `contributors/people.toml`. If not, ask them once
+  whether they want to be credited by more than their username: a real name, a display name, and/or
+  their public GitHub profile name (`sync_github_name = true`). If yes, add **only their own** entry
+  (copy the template at the top of the file, or run
+  `python3 ../../craftrules/scripts/contributors.py --add-me . --real-name "…" --sync-github-name`)
+  and include it in their PR, committed as them. If no, change nothing: they are credited as
+  `@username` anyway.
+- Never add, edit, guess or copy anyone else's entry or name (not from git config, commit authors or
+  GitHub profiles). Never hand-edit `contributors.json`.
+- Maintainers refresh the stats with `python3 ../../craftrules/scripts/contributors.py .` (it also
+  re-verifies who wrote each `people.toml` entry; `--check` only verifies).

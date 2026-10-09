@@ -163,6 +163,11 @@ impl Services for FsServices {
     fn file_loader(&self) -> Option<filmcraft_media::sequence::FrameLoader> {
         Some(std::sync::Arc::new(|p: &str| std::fs::read(p)))
     }
+    /// Media are read in place from the open file: a clip costs its index, not its size.
+    #[cfg(any(unix, windows))]
+    fn reader(&self, path: &str) -> Option<std::io::Result<filmcraft_media::SharedReader>> {
+        Some(filmcraft_media::reader::FileReader::open(std::path::Path::new(path)).map(|r| std::sync::Arc::new(r) as filmcraft_media::SharedReader))
+    }
     fn list_entries(&self, dir: &str) -> Option<std::io::Result<Vec<media_browser::DirEntry>>> {
         Some(media_browser::std_list_entries(dir))
     }
@@ -229,8 +234,17 @@ pub struct EditorState {
     pub targeting: std::collections::BTreeMap<ItemId, Targeting>,
     pub snapping: bool,
     pub linked_selection: bool,
+    /// The Timeline's "Insert and overwrite sequences as nests or individual clips" toggle, turned
+    /// off: a sequence edits in as its clips instead of one nested clip.
+    #[serde(default)]
+    pub sequences_as_clips: bool,
     /// Open sequences (timeline tabs), in tab order.
     pub open_sequences: Vec<ItemId>,
+    /// How each sequence is shown in the Timeline panel (zoom, scroll, track heights): every
+    /// sequence keeps its own. The frontend writes the active sequence's view here as it changes
+    /// and takes a sequence's view from here when it becomes the active one.
+    #[serde(default)]
+    pub timeline_views: std::collections::BTreeMap<ItemId, filmcraft_project::SequenceView>,
     /// Timeline clipboard (serialized track items with their relative track index).
     #[serde(skip)]
     pub clipboard: Vec<(TrackKind, usize, filmcraft_project::TrackItem)>,
@@ -290,10 +304,17 @@ pub struct EditorState {
 /// Events for frontends (drained each frame).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum Event {
-    ProjectChanged { revision: u64 },
-    Toast { message: String, error: bool },
+    ProjectChanged {
+        revision: u64,
+    },
+    Toast {
+        message: String,
+        error: bool,
+    },
     OpenSequence(ItemId),
     OpenSource(ItemId),
+    /// Show this item in the Project panel (Reveal in Project).
+    RevealInProject(ItemId),
 }
 
 pub struct Session {
@@ -383,6 +404,8 @@ impl Job {
             "id": self.id,
             "label": self.label,
             "progress": self.progress.fraction(),
+            // seconds left at the job's recent speed; null until it can tell
+            "etaSeconds": self.progress.eta().map(|d| d.as_secs_f64()),
             "done": self.progress.done.load(Ordering::Relaxed),
             "total": self.progress.total.load(Ordering::Relaxed),
             "status": self.progress.status.lock().unwrap_or_else(|e| e.into_inner()).clone(),
@@ -477,6 +500,7 @@ impl Session {
     pub fn start_autosave(&mut self, cfg: autosave::AutosaveConfig) -> std::io::Result<()> {
         let prefs_path = cfg.data_dir.join("preferences.json");
         self.prefs = autosave::Preferences::load(&prefs_path);
+        self.prefs.apply_hardware_decoding();
         self.media.set_use_proxies(self.prefs.media.enable_proxies);
         self.shortcuts.set_dir(&cfg.data_dir);
         self.presets.set_dir(&cfg.data_dir);
@@ -548,6 +572,7 @@ impl Session {
     pub fn set_prefs(&mut self, p: autosave::Preferences) -> std::io::Result<()> {
         let cache_changed = self.prefs.media_cache != p.media_cache;
         self.prefs = p;
+        self.prefs.apply_hardware_decoding();
         if cache_changed {
             self.apply_media_cache();
         }
@@ -593,7 +618,7 @@ impl Session {
         if self.exec_depth == 0 && spec.journal && self.trim_play.active() {
             self.settle_trim_playback(id);
         }
-        if let Err(why) = (spec.enabled)(self) {
+        if let Err(why) = self.enabled_for(spec, &params) {
             let e = EngineError::Disabled(id.to_string(), why);
             if self.exec_depth == 0 {
                 self.log.push(panels::Level::Warning, id, e.to_string());
@@ -643,8 +668,78 @@ impl Session {
         }
     }
 
+    /// Enablement of `spec` for one call. `enabled()` reads the selection, which is right for the
+    /// menus and for a call without targets. A caller that names its targets in `params`, under a
+    /// key the command documents (`clips` / `clip`: timeline clips, `items` / `item`: project
+    /// items), is asked the same question about those targets instead: the check runs again with
+    /// them standing in for the selection, so every other condition (an open sequence, a filled
+    /// clipboard, the kind of item…) still applies. The selections are put back before returning.
+    fn enabled_for(&mut self, spec: &CommandSpec, params: &Value) -> std::result::Result<(), String> {
+        let by_selection = (spec.enabled)(self);
+        if by_selection.is_ok() {
+            return by_selection;
+        }
+        let clips = commands::named_clips(self, spec, params);
+        let items = commands::named_items(self, spec, params);
+        if clips.is_none() && items.is_none() {
+            return by_selection;
+        }
+        let mut clips = clips.unwrap_or_else(|| self.state.selection.clone());
+        let mut items = items.unwrap_or_else(|| self.state.project_selection.clone());
+        std::mem::swap(&mut self.state.selection, &mut clips);
+        std::mem::swap(&mut self.state.project_selection, &mut items);
+        let by_params = (spec.enabled)(self);
+        self.state.selection = clips;
+        self.state.project_selection = items;
+        by_params
+    }
+
+    /// Whether the command can run on the current selection (what the menus show).
     pub fn is_enabled(&self, id: &str) -> bool {
         commands::find(id).is_some_and(|c| (c.enabled)(self).is_ok())
+    }
+
+    /// What is open, to store beside the project when it is saved.
+    pub fn project_view(&self) -> filmcraft_project::ProjectView {
+        let is_seq = |id: &ItemId| self.project.sequence(*id).is_some();
+        filmcraft_project::ProjectView {
+            open_sequences: self.state.open_sequences.iter().copied().filter(is_seq).collect(),
+            active_sequence: self.state.active_sequence.filter(is_seq),
+            sequences: self.state.timeline_views.iter().filter(|(id, _)| is_seq(id)).map(|(id, v)| (*id, *v)).collect(),
+        }
+    }
+
+    /// Open what was open when the project was saved. Nothing in `view` is trusted: ids that are
+    /// not sequences of this project are dropped (also a second mention of the same sequence),
+    /// and numbers are brought into range. A view without any open sequence leaves the project
+    /// on its first sequence: a project saved by a session that never showed one (a script, the
+    /// CLI) should not open on an empty Timeline.
+    pub fn restore_project_view(&mut self, view: filmcraft_project::ProjectView) {
+        let mut open: Vec<ItemId> = Vec::new();
+        for id in view.open_sequences {
+            if self.project.sequence(id).is_some() && !open.contains(&id) {
+                open.push(id);
+            }
+        }
+        if !open.is_empty() {
+            self.state.active_sequence = view.active_sequence.filter(|id| open.contains(id)).or(open.first().copied());
+            self.state.open_sequences = open;
+        }
+        self.state.timeline_views =
+            view.sequences.into_iter().filter(|(id, _)| self.project.sequence(*id).is_some()).filter_map(|(id, v)| Some((id, v.checked()?))).collect();
+    }
+
+    /// Every edit passes through here: one that would put a sequence inside itself (directly or
+    /// through another nested sequence) is refused, whichever command asked for it. A project that
+    /// was opened with such a sequence already in it can still be edited (and repaired).
+    fn refuse_self_nesting(&self, edited: &Project) -> Result<()> {
+        match edited.nest_cycle() {
+            Some(id) if self.project.nest_cycle().is_none() => {
+                let name = edited.item(id).map(|i| i.name.as_str()).unwrap_or_default();
+                Err(EngineError::Other(format!("a sequence cannot be nested inside itself (\u{201c}{name}\u{201d})")))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Apply an undoable project edit. The closure gets a mutable copy; on error nothing changes.
@@ -652,6 +747,7 @@ impl Session {
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
+        self.refuse_self_nesting(&p)?;
         let old = std::mem::replace(&mut self.project, Arc::new(p));
         self.history.undo.push((label.to_string(), old));
         if self.history.undo.len() > self.history.limit {
@@ -676,6 +772,7 @@ impl Session {
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
         let r = f(&mut p, &mut st)?;
+        self.refuse_self_nesting(&p)?;
         self.project = Arc::new(p);
         self.state = st;
         self.bump();
@@ -684,9 +781,20 @@ impl Session {
 
     /// Edit the active sequence with the edit-algebra context.
     pub fn edit_sequence<R>(&mut self, label: &str, f: impl FnOnce(&mut Sequence, &mut EditCtx, &mut EditorState) -> Result<R>) -> Result<R> {
+        self.edit_sequence_as(label, None, f)
+    }
+
+    /// [`Session::edit_sequence`] that shares one undo step with the previous edit of the same
+    /// `merge` key, like [`Session::edit_merged`] (a drag is one undoable change).
+    pub fn edit_sequence_as<R>(
+        &mut self,
+        label: &str,
+        merge: Option<&str>,
+        f: impl FnOnce(&mut Sequence, &mut EditCtx, &mut EditorState) -> Result<R>,
+    ) -> Result<R> {
         let seq_id = self.state.active_sequence.ok_or(EngineError::NoSequence)?;
         let media = self.media.clone();
-        self.edit(label, move |p, st| {
+        let body = move |p: &mut Project, st: &mut EditorState| {
             let project_snapshot = std::sync::Arc::new(p.clone());
             let snap = project_snapshot.clone();
             let durations = move |id: ItemId| -> Option<Tick> { media_duration(&project_snapshot, &media, id) };
@@ -703,7 +811,11 @@ impl Session {
                 s.check().map_err(EngineError::Other)?;
             }
             Ok(r)
-        })
+        };
+        match merge {
+            Some(key) => self.edit_merged(label, key, body),
+            None => self.edit(label, body),
+        }
     }
 
     pub fn undo(&mut self) -> Option<String> {
@@ -742,6 +854,7 @@ impl Session {
             self.state.active_sequence = p.sequences().next().map(|i| i.id);
         }
         self.state.open_sequences.retain(|s| p.sequence(*s).is_some());
+        self.state.timeline_views.retain(|s, _| p.sequence(*s).is_some());
         if let Some(s) = self.state.source_item
             && p.item(s).is_none()
         {
@@ -825,7 +938,7 @@ impl Session {
     /// Render the active sequence at the playhead in its working colour space (HDR values kept;
     /// for scopes and analysis).
     pub fn render_program_working(&self, scale: f32) -> Option<filmcraft_render::Image> {
-        let seq = self.state.active_sequence?;
+        let seq = self.renderable_sequence(scale).ok()?;
         let provider = self.media.provider(self.project.clone(), self.services.clone());
         let opts = filmcraft_render::RenderOptions { scale, working_output: true, ..Default::default() };
         Some(filmcraft_render::render_sequence(&self.project, seq, self.playhead(), opts, &provider))
@@ -833,10 +946,37 @@ impl Session {
 
     /// Render the active sequence at the playhead (CPU reference path).
     pub fn render_program(&self, scale: f32) -> Option<filmcraft_render::Image> {
-        let seq = self.state.active_sequence?;
+        self.render_program_at(scale, self.playhead())
+    }
+
+    /// Render the active sequence at `t` (snapped to its frame, as the playhead would be) without
+    /// moving the playhead (CPU reference path). `None` when there is no sequence or the frame
+    /// cannot be rendered at `scale`; [`Session::try_render_program_at`] says why.
+    pub fn render_program_at(&self, scale: f32, t: Tick) -> Option<filmcraft_render::Image> {
+        self.try_render_program_at(scale, t).ok()
+    }
+
+    /// [`Session::render_program_at`], with the reason when nothing can be rendered.
+    pub fn try_render_program_at(&self, scale: f32, t: Tick) -> Result<filmcraft_render::Image> {
+        let seq = self.renderable_sequence(scale)?;
+        let t = self.sequence_rate().snap(t.max(Tick::ZERO));
         let provider = self.media.provider(self.project.clone(), self.services.clone());
         let opts = filmcraft_render::RenderOptions { scale, captions: true, ..Default::default() };
-        Some(filmcraft_render::render_sequence(&self.project, seq, self.playhead(), opts, &provider))
+        Ok(filmcraft_render::render_sequence(&self.project, seq, t, opts, &provider))
+    }
+
+    /// The active sequence, if a frame of it at `scale` is within the image size limits.
+    fn renderable_sequence(&self, scale: f32) -> Result<ItemId> {
+        let id = self.state.active_sequence.ok_or(EngineError::NoSequence)?;
+        let seq = self.project.sequence(id).ok_or(EngineError::NoSequence)?;
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(EngineError::Other(format!("render scale {scale} must be finite and positive")));
+        }
+        let (w, h) = filmcraft_render::output_size(seq, scale);
+        let size = u32::try_from(w).ok().zip(u32::try_from(h).ok());
+        let Some((w, h)) = size else { return Err(EngineError::Other("the requested render frame exceeds the image size limits".into())) };
+        filmcraft_project::validate_frame_size(w, h).map_err(|e| EngineError::Other(format!("cannot render a {w}x{h} frame: {e}")))?;
+        Ok(id)
     }
 }
 
@@ -851,19 +991,31 @@ pub fn media_start(p: &Project, id: ItemId) -> Tick {
 
 /// Media duration of an item (None for stills/adjustment layers = unlimited handles).
 pub fn media_duration(p: &Project, _pool: &MediaPool, id: ItemId) -> Option<Tick> {
-    let it = p.item(id)?;
-    match &it.kind {
-        filmcraft_project::ItemKind::Media(m) => match m.info.kind {
-            filmcraft_media::MediaKind::Still | filmcraft_media::MediaKind::Synthetic => None,
-            _ => Some(m.info.duration),
-        },
-        filmcraft_project::ItemKind::Sequence(s) => Some(s.duration()),
-        // a subclip that restricts trims ends at its Out point; otherwise its parent's media is the limit
-        filmcraft_project::ItemKind::Subclip { range, restrict_trims: true, .. } => Some(range.end()),
-        filmcraft_project::ItemKind::Subclip { parent, .. } => media_duration(p, _pool, *parent),
-        filmcraft_project::ItemKind::AdjustmentLayer { .. } | filmcraft_project::ItemKind::Graphic { .. } => None,
+    // a subclip's limit is its parent's: follow the chain, bounded (a damaged project file can make
+    // it cyclic or arbitrarily deep)
+    let mut id = id;
+    for _ in 0..=MAX_SUBCLIP_CHAIN {
+        let it = p.item(id)?;
+        return match &it.kind {
+            filmcraft_project::ItemKind::Media(m) => match m.info.kind {
+                filmcraft_media::MediaKind::Still | filmcraft_media::MediaKind::Synthetic => None,
+                _ => Some(m.info.duration),
+            },
+            filmcraft_project::ItemKind::Sequence(s) => Some(s.duration()),
+            // a subclip that restricts trims ends at its Out point; otherwise its parent's media is the limit
+            filmcraft_project::ItemKind::Subclip { range, restrict_trims: true, .. } => Some(range.end()),
+            filmcraft_project::ItemKind::Subclip { parent, .. } => {
+                id = *parent;
+                continue;
+            }
+            filmcraft_project::ItemKind::AdjustmentLayer { .. } | filmcraft_project::ItemKind::Graphic { .. } => None,
+        };
     }
+    None
 }
+
+/// Subclips of subclips followed before giving up (real projects nest one or two deep).
+const MAX_SUBCLIP_CHAIN: usize = 16;
 
 #[cfg(test)]
 mod aaf_omf_tests;
@@ -878,13 +1030,19 @@ mod color_tests;
 #[cfg(test)]
 mod essential_sound_tests;
 #[cfg(test)]
+mod explicit_targets_tests;
+#[cfg(test)]
 mod export_tests;
 #[cfg(test)]
 mod file_tests;
 #[cfg(test)]
 mod image_sequence_tests;
 #[cfg(test)]
+mod interchange_auto_points_tests;
+#[cfg(test)]
 mod keyboard_tests;
+#[cfg(test)]
+mod linked_speed_tests;
 #[cfg(test)]
 mod masks_tests;
 #[cfg(test)]
@@ -895,6 +1053,12 @@ mod media_test_util;
 mod mixer_tests;
 #[cfg(test)]
 mod multicam_tests;
+#[cfg(test)]
+mod nest_editing_tests;
+#[cfg(test)]
+mod nest_fidelity_tests;
+#[cfg(test)]
+mod nesting_tests;
 #[cfg(test)]
 mod panels_tests;
 #[cfg(test)]
@@ -912,7 +1076,13 @@ mod relink_tests;
 #[cfg(test)]
 mod remix_tests;
 #[cfg(test)]
+mod ripple_delete_tests;
+#[cfg(test)]
 mod scopes_tests;
+#[cfg(test)]
+mod sequence_inspect_tests;
+#[cfg(test)]
+mod sequence_tabs_tests;
 #[cfg(test)]
 mod sequence_tools_tests;
 #[cfg(test)]
@@ -920,7 +1090,13 @@ mod settings_tests;
 #[cfg(test)]
 mod shortcuts_tests;
 #[cfg(test)]
+mod split_edit_ripple_trim_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod timeline_move_tests;
+#[cfg(test)]
+mod track_params_tests;
 #[cfg(test)]
 mod transcript_tests;
 #[cfg(test)]

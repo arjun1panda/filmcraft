@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{Yuv, ffmpeg, ffmpeg_decode, ffmpeg_source, ffprobe, out_dir, psnr, synth};
+use common::{Yuv, annexb_nals, ffmpeg, ffmpeg_decode, ffmpeg_source, ffprobe, out_dir, psnr, synth};
 use filmcraft_h264enc::*;
 use std::process::Command;
 
@@ -101,6 +101,36 @@ fn bit_exact_profiles_presets() {
     }
 }
 
+/// The oracle must see a damaged multi-slice picture (#74): a missing slice used to decode silently
+/// at `-v error -ec 0`, and `-ec 0` at `-v warning` flags clean multi-slice pictures too.
+#[test]
+fn oracle_reports_damaged_slices() {
+    if ffmpeg().is_none() {
+        return;
+    }
+    let (w, h, n) = (176, 144, 6);
+    let frames: Vec<Yuv> = (0..n).map(|t| synth(w, h, t)).collect();
+    for (name, profile) in [("cavlc", Profile::Baseline), ("cabac", Profile::High)] {
+        let run = encode(cfg(w, h, profile, Preset::Balanced, 0, RateControl::Qp(26), 3), &frames);
+        // the undamaged 3-slice stream decodes without a single message
+        verify(&format!("damage_{name}_clean"), &run, w, h, n);
+        let slices: Vec<_> = annexb_nals(&run.stream).into_iter().filter(|r| matches!(run.stream[r.start + 3] & 0x1f, 1 | 5)).collect();
+        assert_eq!(slices.len(), 3 * n, "{name}: three slices per picture");
+        for (k, slice) in [(1usize, &slices[4]), (3, &slices[10])] {
+            let mut dropped = run.stream.clone();
+            dropped.drain(slice.clone());
+            let mut truncated = run.stream.clone();
+            truncated.drain(slice.start + slice.len() / 2..slice.end);
+            for (damage, stream) in [("dropped", dropped), ("truncated", truncated)] {
+                let path = out_dir("oracle").join(format!("damage_{name}_{damage}_{k}.h264"));
+                std::fs::write(&path, &stream).unwrap();
+                let (err, _) = ffmpeg_decode(&path);
+                assert!(!err.trim().is_empty(), "{name}: the oracle missed a {damage} slice in picture {k}");
+            }
+        }
+    }
+}
+
 #[test]
 fn bit_exact_lavfi_sources() {
     if ffmpeg().is_none() {
@@ -155,6 +185,32 @@ fn abr_hits_target() {
         eprintln!("{name}: {k:.1} kbps (target {target})");
         assert!((k - target).abs() / target <= 0.10, "{name}: {k:.1} kbps vs target {target}");
     }
+}
+
+/// 1-pass VBR must not starve the opening second of a 60 fps export (#74): the rate model's initial guess
+/// is several times too pessimistic, and a virtual history frozen at that guess kept the pictures after the
+/// first one 6–9 dB below the rest until it faded out after one second.
+#[test]
+fn vbr_opening_second_is_not_starved() {
+    if ffmpeg().is_none() {
+        return;
+    }
+    let (w, h, n, fps) = (640, 360, 120, 60);
+    let frames: Vec<Yuv> = (0..n).map(|t| synth(w, h, t)).collect();
+    let mut c = cfg(w, h, Profile::High, Preset::Balanced, 2, RateControl::Vbr { target_kbps: 2000, max_kbps: 3000 }, 0);
+    c.fps_num = fps;
+    c.keyint = 2 * fps;
+    let run = encode(c, &frames);
+    let dec = verify("vbr_opening", &run, w, h, n);
+    let fs = w * h * 3 / 2;
+    let ps: Vec<f64> = frames.iter().enumerate().map(|(i, f)| psnr(&dec[i * fs..i * fs + w * h], &f.y)).collect();
+    let mean = |r: std::ops::Range<usize>| ps[r.clone()].iter().sum::<f64>() / r.len() as f64;
+    // 0.1–0.5 s against everything after the first second (the same GOP, so no new I frame in between).
+    let (opening, settled) = (mean(6..30), mean(60..n));
+    let kbps = run.stream.len() as f64 * 8.0 / (n as f64 / fps as f64) / 1000.0;
+    eprintln!("opening {opening:.2} dB, after 1 s {settled:.2} dB, {kbps:.1} kbps");
+    assert!(settled - opening <= 3.0, "opening second starved: {opening:.2} dB vs {settled:.2} dB after 1 s");
+    assert!((kbps - 2000.0).abs() / 2000.0 <= 0.10, "{kbps:.1} kbps vs target 2000");
 }
 
 #[test]

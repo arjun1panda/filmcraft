@@ -323,11 +323,7 @@ fn placed_item(p: &mut Project, item: ItemId, kind: TrackKind, exact: Tick, rang
 }
 
 fn sync_source_size(p: &Project, item: ItemId) -> Option<(u32, u32)> {
-    match &p.item(item)?.kind {
-        ItemKind::Media(m) => m.info.video.as_ref().map(|v| (v.width, v.height)),
-        ItemKind::Subclip { parent, .. } => sync_source_size(p, *parent),
-        _ => None,
-    }
+    p.resolve_media(item).and_then(|(_, media, _)| media.info.video.as_ref().map(|video| (video.width, video.height)))
 }
 
 // ---------------------------------------------------------------- Synchronize
@@ -382,7 +378,7 @@ fn synchronize(s: &mut Session, p: &Value) -> Result<Value> {
     // reference unit
     let reference = if let Some(c) = u64_p(p, "reference").map(ClipId) {
         units.iter().position(|u| u.members.contains(&c)).ok_or_else(|| bad(cmd, "`reference` is not among the clips"))?
-    } else if let Some(t) = track_p(s, p, "track") {
+    } else if let Some(t) = track_p(s, p, "track", cmd)? {
         units
             .iter()
             .position(|u| u.members.iter().any(|m| q.track(t).is_some_and(|tr| tr.item(*m).is_some())))

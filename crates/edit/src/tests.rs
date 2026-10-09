@@ -144,8 +144,83 @@ fn ripple_delete_and_conflict() {
     // audio under the gap blocks the ripple
     let b = fx.put(v1, 20, 10, 0);
     fx.put(a1, 22, 3, 0);
-    assert_eq!(ripple_delete_items(&mut fx.seq, &[b]), Err(EditError::SyncLockConflict));
+    assert_eq!(ripple_delete_items(&mut fx.seq, &[b]), Err(EditError::SyncLockConflict("A1".into())), "names the track in the way");
     assert_eq!(fx.spans(v1), vec![(0, 10), (20, 10)], "unchanged on failure");
+}
+
+#[test]
+fn ripple_delete_closes_the_time_free_on_every_track() {
+    // four clips on V1 with their sounds on A1; the second sound starts 2 early and ends 2 late
+    let build = || {
+        let mut fx = Fx::new();
+        let (v1, a1) = (fx.v(0), fx.a(0));
+        let v: Vec<ClipId> = [(0, 10), (10, 10), (20, 10), (30, 10)].iter().map(|(s, d)| fx.put(v1, *s, *d, 0)).collect();
+        let a: Vec<ClipId> = [(0, 8), (8, 14), (22, 8), (30, 10)].iter().map(|(s, d)| fx.put(a1, *s, *d, 0)).collect();
+        (fx, v, a)
+    };
+    let span = |start, len| TimeRange::new(f(start), f(len));
+    // one clip with a split edit on both sides: the picture's stretch closes, everything later stays in sync
+    let (mut fx, v, a) = build();
+    assert_eq!(ripple_delete_items(&mut fx.seq, &[v[1], a[1]]), Ok(vec![span(10, 10)]));
+    assert_eq!(fx.spans(fx.v(0)), vec![(0, 10), (10, 10), (20, 10)]);
+    assert_eq!(fx.spans(fx.a(0)), vec![(0, 8), (12, 8), (20, 10)]);
+    fx.seq.check().unwrap();
+    // two neighbours with a split edit between them close as one stretch
+    let (mut fx, v, a) = build();
+    assert_eq!(ripple_delete_items(&mut fx.seq, &[v[1], a[1], v[2], a[2]]), Ok(vec![span(10, 20)]));
+    assert_eq!(fx.spans(fx.v(0)), vec![(0, 10), (10, 10)]);
+    assert_eq!(fx.spans(fx.a(0)), vec![(0, 8), (10, 10)]);
+    // clips apart in time each close their own gap
+    let (mut fx, v, a) = build();
+    assert_eq!(ripple_delete_items(&mut fx.seq, &[v[0], a[0], v[3], a[3]]), Ok(vec![span(0, 8), span(30, 10)]));
+    fx.seq.check().unwrap();
+
+    // straight cuts with the sounds on alternating tracks: V1 [0,10) [10,20) [20,30), A1 [0,10) [20,30), A2 [10,20)
+    let mut fx = Fx::new();
+    let (v1, a1, a2) = (fx.v(0), fx.a(0), fx.a(1));
+    let v: Vec<ClipId> = [0, 10, 20].iter().map(|s| fx.put(v1, *s, 10, 0)).collect();
+    let (s0, s1) = (fx.put(a1, 0, 10, 0), fx.put(a2, 10, 10, 0));
+    fx.put(a1, 20, 10, 0);
+    assert_eq!(ripple_delete_items(&mut fx.seq, &[v[0], s0, v[1], s1]), Ok(vec![span(0, 20)]));
+    assert_eq!((fx.spans(v1), fx.spans(a1), fx.spans(a2)), (vec![(0, 10)], vec![(0, 10)], vec![]));
+
+    // a sound shorter than its picture with nothing round it: the whole picture closes
+    let mut fx = Fx::new();
+    let (v1, a1) = (fx.v(0), fx.a(0));
+    let (p, s) = (fx.put(v1, 10, 10, 0), fx.put(a1, 12, 6, 0));
+    fx.put(v1, 20, 10, 0);
+    fx.put(a1, 20, 10, 0);
+    assert_eq!(ripple_delete_items(&mut fx.seq, &[p, s]), Ok(vec![span(10, 10)]));
+    // with the neighbours' sound right up against it, only the sound's stretch can close
+    let mut fx = Fx::new();
+    let (v1, a1) = (fx.v(0), fx.a(0));
+    fx.put(a1, 0, 12, 0);
+    let (p, s) = (fx.put(v1, 10, 10, 0), fx.put(a1, 12, 6, 0));
+    fx.put(v1, 20, 10, 0);
+    fx.put(a1, 18, 12, 0);
+    assert_eq!(ripple_delete_items(&mut fx.seq, &[p, s]), Ok(vec![span(12, 6)]));
+    assert_eq!((fx.spans(v1), fx.spans(a1)), (vec![(14, 10)], vec![(0, 12), (12, 12)]));
+
+    // a linked sound on a locked track stays, and does not shrink the gap that closes
+    let mut fx = Fx::new();
+    let (v1, a1) = (fx.v(0), fx.a(0));
+    let (p, s) = (fx.put(v1, 10, 10, 0), fx.put(a1, 12, 6, 0));
+    fx.put(v1, 20, 10, 0);
+    fx.seq.track_mut(a1).unwrap().locked = true;
+    fx.seq.track_mut(a1).unwrap().sync_lock = false;
+    assert_eq!(ripple_delete_items(&mut fx.seq, &[p, s]), Ok(vec![span(10, 10)]));
+    assert_eq!((fx.spans(v1), fx.spans(a1)), (vec![(10, 10)], vec![(12, 6)]));
+
+    // nothing can close: what stays on each track covers the other track's deleted time. Refused, unchanged.
+    let mut fx = Fx::new();
+    let (v1, a1) = (fx.v(0), fx.a(0));
+    let x = fx.put(v1, 10, 10, 0);
+    fx.put(v1, 30, 10, 0);
+    fx.put(a1, 10, 10, 0);
+    let y = fx.put(a1, 30, 10, 0);
+    let before = fx.seq.clone();
+    assert!(matches!(ripple_delete_items(&mut fx.seq, &[x, y]), Err(EditError::Other(_))));
+    assert_eq!(fx.seq, before);
 }
 
 #[test]
@@ -190,6 +265,79 @@ fn ripple_trim_shifts_following() {
     assert_eq!(fx.spans(a1), vec![(34, 5)]);
     trim(&mut fx.seq, a, Edge::In, TrimMode::Ripple, f(2), &mut Fx::ctx(&mut n)).unwrap();
     assert_eq!(fx.spans(v1), vec![(0, 12), (12, 10)]);
+}
+
+#[test]
+fn ripple_trim_group_takes_a_split_edit_along() {
+    // V1: a [0,10) then b [10,20). b's linked sound leads it by 4 on sync-locked A1: [6,20).
+    let mut fx = Fx::new();
+    let (v1, a1) = (fx.v(0), fx.a(0));
+    let a = fx.put(v1, 0, 10, 0);
+    let b = fx.put(v1, 10, 10, 0);
+    let sound = fx.put(a1, 6, 14, 0);
+    for c in [b, sound] {
+        fx.seq.find_item_mut(c).unwrap().1.link = Some(7);
+    }
+    let mut n = fx.next;
+    ripple_trim_group(&mut fx.seq, &[a], Edge::Out, f(3), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!((fx.spans(v1), fx.spans(a1)), (vec![(0, 13), (13, 10)], vec![(9, 14)]), "longer: the early sound follows its picture");
+    ripple_trim_group(&mut fx.seq, &[a], Edge::Out, -f(5), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!((fx.spans(v1), fx.spans(a1)), (vec![(0, 8), (8, 10)], vec![(4, 14)]), "shorter: it follows too");
+    // the sound would start before the sequence does: refused, nothing changes
+    assert!(matches!(ripple_trim_group(&mut fx.seq, &[a], Edge::Out, -f(5), &mut Fx::ctx(&mut n)), Err(EditError::SyncLockConflict(_))));
+    // another clip right before the sound leaves it no room either
+    fx.put(a1, 0, 4, 0);
+    assert!(matches!(ripple_trim_group(&mut fx.seq, &[a], Edge::Out, -f(2), &mut Fx::ctx(&mut n)), Err(EditError::SyncLockConflict(_))));
+    assert_eq!((fx.spans(v1), fx.spans(a1)), (vec![(0, 8), (8, 10)], vec![(0, 4), (4, 14)]), "unchanged on failure");
+    // a linked clip that ends before the cut is not a split edit and stays where it is
+    let early = fx.put(fx.a(1), 0, 3, 0);
+    fx.seq.find_item_mut(early).unwrap().1.link = Some(7);
+    ripple_trim_group(&mut fx.seq, &[a], Edge::Out, f(2), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!(fx.spans(fx.a(1)), vec![(0, 3)]);
+    fx.seq.check().unwrap();
+
+    // In edge: V1 b [10,20), c [20,30); c's sound starts 12 early on A1: [8,30). b loses 3 at its head.
+    let mut fx = Fx::new();
+    let (v1, v2, a1, a2) = (fx.v(0), fx.v(1), fx.a(0), fx.a(1));
+    fx.put(v1, 0, 10, 0);
+    let b = fx.put(v1, 10, 10, 0);
+    let c = fx.put(v1, 20, 10, 0);
+    let c_sound = fx.put(a1, 8, 22, 0);
+    // two more clips linked to b that the caller did not put in the group
+    let b_sound = fx.put(a2, 10, 10, 0);
+    let b_top = fx.put(v2, 12, 8, 0);
+    for (x, link) in [(c, 7), (c_sound, 7), (b, 8), (b_sound, 8), (b_top, 8)] {
+        fx.seq.find_item_mut(x).unwrap().1.link = Some(link);
+    }
+    let mut n = fx.next;
+    ripple_trim_group(&mut fx.seq, &[b], Edge::In, f(3), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!((fx.spans(v1), fx.spans(a1)), (vec![(0, 10), (10, 7), (17, 10)], vec![(5, 22)]), "c and its early sound move up together");
+    assert_eq!((fx.spans(v2), fx.spans(a2)), (vec![(9, 8)], vec![(10, 10)]), "the trimmed clip's own partners never follow");
+
+    // a crossfade into the early sound from a clip that stays behind no longer sits on a cut: it goes
+    let mut fx = Fx::new();
+    let (v1, a1) = (fx.v(0), fx.a(0));
+    let a = fx.put(v1, 0, 10, 0);
+    let b = fx.put(v1, 10, 10, 0);
+    let stays = fx.put(a1, 0, 6, 0);
+    let sound = fx.put(a1, 6, 14, 0);
+    for x in [b, sound] {
+        fx.seq.find_item_mut(x).unwrap().1.link = Some(7);
+    }
+    fx.seq.track_mut(a1).unwrap().transitions = vec![Transition {
+        id: TransitionId(1),
+        effect: filmcraft_project::find_effect("cross_dissolve").unwrap().instance(),
+        start: f(4),
+        duration: f(4),
+        from: Some(stays),
+        to: Some(sound),
+        align: Default::default(),
+        reverse: false,
+    }];
+    let mut n = fx.next;
+    ripple_trim_group(&mut fx.seq, &[a], Edge::Out, f(3), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!(fx.spans(a1), vec![(0, 6), (9, 14)]);
+    assert!(fx.seq.track(a1).unwrap().transitions.is_empty());
 }
 
 #[test]
@@ -267,6 +415,44 @@ fn rate_stretch_and_speed() {
     assert!((s - 0.5).abs() < 1e-9);
     set_speed(&mut fx.seq, a, 2.0, false, true, &mut Fx::ctx(&mut n)).unwrap();
     assert_eq!(fx.spans(v1), vec![(0, 5)]);
+}
+
+#[test]
+fn speed_on_a_linked_group_ripples_once() {
+    // V1: a [0,10), b [10,20). A1: a's sound [0,10), b's sound [10,20).
+    let build = |sound_len: i64| {
+        let mut fx = Fx::new();
+        let (v1, a1) = (fx.v(0), fx.a(0));
+        let a = fx.put(v1, 0, 10, 0);
+        fx.put(v1, 10, 10, 0);
+        let sound = fx.put(a1, 0, sound_len, 0);
+        fx.put(a1, sound_len, 10, 0);
+        (fx, a, sound)
+    };
+    for (speed, picture, later) in [(0.5, (0, 20), (20, 10)), (2.0, (0, 5), (5, 10))] {
+        let (mut fx, a, sound) = build(10);
+        let mut n = fx.next;
+        set_speed_group(&mut fx.seq, &[a, sound], speed, false, true, &mut Fx::ctx(&mut n)).unwrap();
+        assert_eq!((fx.spans(fx.v(0)), fx.spans(fx.a(0))), (vec![picture, later], vec![picture, later]), "{speed}");
+    }
+    // a split edit: the sound is 4 longer. Later clips move by the larger change, on both tracks.
+    let (mut fx, a, sound) = build(14);
+    let mut n = fx.next;
+    set_speed_group(&mut fx.seq, &[a, sound], 0.5, false, true, &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!((fx.spans(fx.v(0)), fx.spans(fx.a(0))), (vec![(0, 20), (24, 10)], vec![(0, 28), (28, 10)]));
+    let (mut fx, a, sound) = build(14);
+    let mut n = fx.next;
+    set_speed_group(&mut fx.seq, &[a, sound], 2.0, false, true, &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!((fx.spans(fx.v(0)), fx.spans(fx.a(0))), (vec![(0, 5), (5, 10)], vec![(0, 7), (9, 10)]));
+    fx.seq.check().unwrap();
+    // two clips of one track are not one group; a missing clip changes nothing
+    let (mut fx, a, _) = build(10);
+    let b = fx.seq.video_tracks[0].items[1].id;
+    let before = fx.seq.clone();
+    let mut n = fx.next;
+    assert!(set_speed_group(&mut fx.seq, &[a, b], 2.0, false, true, &mut Fx::ctx(&mut n)).is_err());
+    assert!(set_speed_group(&mut fx.seq, &[a, ClipId(1)], 2.0, false, true, &mut Fx::ctx(&mut n)).is_err());
+    assert_eq!(fx.seq, before);
 }
 
 #[test]
@@ -366,4 +552,123 @@ fn merge(v: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
 #[test]
 fn unused_kind_import() {
     let _ = TrackKind::Video;
+}
+
+#[test]
+fn hostile_speeds_are_refused_or_clamped_never_overflow() {
+    // a tiny speed used to saturate the new duration to i64::MAX, then the ripple shift overflowed
+    for speed in [1e-7, 1e-300, f64::MIN_POSITIVE, f64::NAN, f64::INFINITY, -1.0, 0.0] {
+        let mut fx = Fx::new();
+        let v1 = fx.v(0);
+        let a = fx.put(v1, 0, 10, 10);
+        let _b = fx.put(v1, 10, 10, 10);
+        let before = fx.seq.clone();
+        let mut n = fx.next;
+        let r = set_speed_group(&mut fx.seq, &[a], speed, false, true, &mut Fx::ctx(&mut n));
+        match r {
+            Ok(()) => fx.seq.check().unwrap(),
+            Err(_) => assert_eq!(format!("{:?}", fx.seq), format!("{before:?}"), "{speed}: a refused edit changes nothing"),
+        }
+    }
+}
+
+#[test]
+fn shorter_head_into_an_l_cut_keeps_the_earlier_sound_where_it_is() {
+    // V1: a [0,10), b [10,20), c [20,30). a's sound on sync-locked A1 runs 3 into b: [0,13) (an L
+    // cut). b loses 3 at its head: a never moves, so its sound stays and the L cut still ends at 13.
+    let mut fx = Fx::new();
+    let (v1, a1) = (fx.v(0), fx.a(0));
+    let a = fx.put(v1, 0, 10, 0);
+    let b = fx.put(v1, 10, 10, 0);
+    fx.put(v1, 20, 10, 0);
+    let a_sound = fx.put(a1, 0, 13, 0);
+    for x in [a, a_sound] {
+        fx.seq.find_item_mut(x).unwrap().1.link = Some(7);
+    }
+    let mut n = fx.next;
+    ripple_trim_group(&mut fx.seq, &[b], Edge::In, f(3), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!((fx.spans(v1), fx.spans(a1)), (vec![(0, 10), (10, 7), (17, 10)], vec![(0, 13)]));
+    fx.seq.check().unwrap();
+
+    // later material on A1 moves up with the pictures; landing on the L cut's sound refuses
+    let later = fx.put(a1, 15, 5, 0);
+    assert!(matches!(ripple_trim_group(&mut fx.seq, &[b], Edge::In, f(3), &mut Fx::ctx(&mut n)), Err(EditError::SyncLockConflict(_))));
+    assert_eq!(fx.spans(a1), vec![(0, 13), (15, 5)], "unchanged on failure");
+    fx.seq.find_item_mut(later).unwrap().1.start = f(20);
+    ripple_trim_group(&mut fx.seq, &[b], Edge::In, f(2), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!((fx.spans(v1), fx.spans(a1)), (vec![(0, 10), (10, 5), (15, 10)], vec![(0, 13), (18, 5)]));
+
+    // unlinked material across the cut (a music bed) still refuses
+    let mut fx = Fx::new();
+    let (v1, a1) = (fx.v(0), fx.a(0));
+    fx.put(v1, 0, 10, 0);
+    let b = fx.put(v1, 10, 10, 0);
+    fx.put(a1, 0, 13, 0);
+    let mut n = fx.next;
+    assert!(matches!(ripple_trim_group(&mut fx.seq, &[b], Edge::In, f(3), &mut Fx::ctx(&mut n)), Err(EditError::SyncLockConflict(_))));
+    // so does a link with no partner left
+    fx.seq.track_mut(a1).unwrap().items[0].link = Some(9);
+    assert!(matches!(ripple_trim_group(&mut fx.seq, &[b], Edge::In, f(3), &mut Fx::ctx(&mut n)), Err(EditError::SyncLockConflict(_))));
+
+    // a linked cutaway across the cut whose own partner reaches past it too is no L cut: it refuses
+    let mut fx = Fx::new();
+    let (v1, v2, a1) = (fx.v(0), fx.v(1), fx.a(0));
+    fx.put(v1, 0, 10, 0);
+    let b = fx.put(v1, 10, 10, 0);
+    fx.put(v1, 20, 10, 0);
+    let x = fx.put(v2, 5, 20, 0);
+    let xs = fx.put(a1, 5, 20, 0);
+    for c in [x, xs] {
+        fx.seq.find_item_mut(c).unwrap().1.link = Some(7);
+    }
+    let mut n = fx.next;
+    assert!(matches!(ripple_trim_group(&mut fx.seq, &[b], Edge::In, f(3), &mut Fx::ctx(&mut n)), Err(EditError::SyncLockConflict(_))));
+}
+
+#[test]
+fn shorter_head_closes_the_stretch_after_the_cut_on_sync_locked_tracks() {
+    // V1: a [0,10), b [10,20). a's sound on sync-locked A1 runs up to the cut: [0,10). b loses 3 at
+    // its head; the stretch that closes is [10,13), where A1 is empty, so nothing refuses.
+    for group in [false, true] {
+        let mut fx = Fx::new();
+        let (v1, a1) = (fx.v(0), fx.a(0));
+        fx.put(v1, 0, 10, 0);
+        let b = fx.put(v1, 10, 10, 0);
+        fx.put(v1, 20, 10, 0);
+        fx.put(a1, 0, 10, 0);
+        let later = fx.put(a1, 20, 5, 0);
+        let mut n = fx.next;
+        if group {
+            ripple_trim_group(&mut fx.seq, &[b], Edge::In, f(3), &mut Fx::ctx(&mut n)).unwrap();
+        } else {
+            trim(&mut fx.seq, b, Edge::In, TrimMode::Ripple, f(3), &mut Fx::ctx(&mut n)).unwrap();
+        }
+        assert_eq!((fx.spans(v1), fx.spans(a1)), (vec![(0, 10), (10, 7), (17, 10)], vec![(0, 10), (17, 5)]), "group {group}");
+        // material inside the stretch that closes still refuses
+        fx.seq.find_item_mut(later).unwrap().1.start = f(11);
+        let r = if group {
+            ripple_trim_group(&mut fx.seq, &[b], Edge::In, f(2), &mut Fx::ctx(&mut n))
+        } else {
+            trim(&mut fx.seq, b, Edge::In, TrimMode::Ripple, f(2), &mut Fx::ctx(&mut n))
+        };
+        assert!(matches!(r, Err(EditError::SyncLockConflict(_))), "group {group}");
+    }
+    // a clip on a sync-locked track that starts at the cut stays put while the pictures after it move
+    // up: only the stretch after the cut sees it (the old stretch, before the cut, let it through)
+    for group in [false, true] {
+        let mut fx = Fx::new();
+        let (v1, a1) = (fx.v(0), fx.a(0));
+        fx.put(v1, 0, 10, 0);
+        let b = fx.put(v1, 10, 10, 0);
+        fx.put(v1, 20, 10, 0);
+        fx.put(a1, 10, 5, 0);
+        let mut n = fx.next;
+        let r = if group {
+            ripple_trim_group(&mut fx.seq, &[b], Edge::In, f(3), &mut Fx::ctx(&mut n))
+        } else {
+            trim(&mut fx.seq, b, Edge::In, TrimMode::Ripple, f(3), &mut Fx::ctx(&mut n))
+        };
+        assert!(matches!(r, Err(EditError::SyncLockConflict(_))), "group {group}");
+        assert_eq!(fx.spans(v1), vec![(0, 10), (10, 10), (20, 10)], "unchanged on failure");
+    }
 }

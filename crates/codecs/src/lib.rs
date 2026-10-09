@@ -18,8 +18,11 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+pub mod apv;
 pub mod audio;
 pub mod gop;
+pub mod hw;
+mod hw_frame;
 pub mod mkv;
 pub mod mp4;
 pub mod mpeg;
@@ -29,8 +32,9 @@ pub mod video;
 
 use std::sync::{Arc, RwLock};
 
+pub use apv::ApvSource;
 pub use audio::AudioFileSource;
-pub use gop::{GopStats, gop_stats};
+pub use gop::{FRAME_BUDGET, GopStats, cached_bytes, gop_stats, live_decoders};
 pub use mkv::MkvSource;
 pub use mp4::Mp4Source;
 pub use mpeg::MpegSource;
@@ -63,20 +67,22 @@ impl From<CodecError> for filmcraft_media::MediaError {
     }
 }
 
+/// Our own (pure-Rust) decoders, in the order they are tried.
+const BUILTIN_FACTORIES: [VideoDecoderFactory; 9] = [
+    video::h264_factory,
+    video::hevc_factory,
+    video::vp9_factory,
+    video::av1_factory,
+    video::apv_factory,
+    video::prores_factory,
+    video::dnx_factory,
+    video::mjpeg_factory,
+    video::mpeg2_factory,
+];
+
 fn factories() -> &'static RwLock<Vec<VideoDecoderFactory>> {
     static F: std::sync::OnceLock<RwLock<Vec<VideoDecoderFactory>>> = std::sync::OnceLock::new();
-    F.get_or_init(|| {
-        RwLock::new(vec![
-            video::h264_factory,
-            video::hevc_factory,
-            video::vp9_factory,
-            video::av1_factory,
-            video::prores_factory,
-            video::dnx_factory,
-            video::mjpeg_factory,
-            video::mpeg2_factory,
-        ])
-    })
+    F.get_or_init(|| RwLock::new(BUILTIN_FACTORIES.to_vec()))
 }
 
 /// Register a video decoder factory (tried before previously registered ones).
@@ -85,6 +91,11 @@ pub fn register_video_decoder(f: VideoDecoderFactory) {
     if !g.iter().any(|x| std::ptr::fn_addr_eq(*x, f)) {
         g.insert(0, f);
     }
+}
+
+/// Whether `f` is among the registered video decoder factories (startup diagnostics, tests).
+pub fn video_decoder_registered(f: VideoDecoderFactory) -> bool {
+    factories().read().unwrap_or_else(|e| e.into_inner()).iter().any(|x| std::ptr::fn_addr_eq(*x, f))
 }
 
 /// Create a decoder for a sample entry.
@@ -98,15 +109,26 @@ pub fn make_video_decoder(entry: &filmcraft_isobmff::SampleEntry) -> Result<Box<
     Err(CodecError::Unsupported(format!("no decoder for {} video", entry.codec.name())))
 }
 
+/// Create one of our own (software) decoders for a sample entry, skipping registered factories:
+/// what a hardware decoder falls back to when it fails mid-stream.
+pub fn software_video_decoder(entry: &filmcraft_isobmff::SampleEntry) -> Result<Box<dyn VideoDecoder>> {
+    for f in BUILTIN_FACTORIES {
+        if let Some(r) = f(entry) {
+            return r;
+        }
+    }
+    Err(CodecError::Unsupported(format!("no decoder for {} video", entry.codec.name())))
+}
+
 /// Openers for the engine's media pool (MP4/MOV, Matroska/WebM, MXF, Ogg Opus/Vorbis, MPEG TS/PS and
-/// MPEG-1/2 video elementary streams, standalone audio).
+/// MPEG-1/2 video elementary streams, APV raw bitstreams, standalone audio).
 pub fn openers() -> Vec<filmcraft_media::Opener> {
-    vec![mp4::opener, mkv::opener, mxf::opener, ogg::opener, mpeg::opener, audio::opener]
+    vec![mp4::opener, mkv::opener, mxf::opener, ogg::opener, mpeg::opener, apv::opener, audio::opener]
 }
 
 fn reader_registry() -> &'static RwLock<Vec<filmcraft_media::ReaderOpener>> {
     static R: std::sync::OnceLock<RwLock<Vec<filmcraft_media::ReaderOpener>>> = std::sync::OnceLock::new();
-    R.get_or_init(|| RwLock::new(vec![mp4::reader_opener, mkv::reader_opener, mxf::reader_opener, ogg::reader_opener, mpeg::reader_opener]))
+    R.get_or_init(|| RwLock::new(vec![mp4::reader_opener, mkv::reader_opener, mxf::reader_opener, ogg::reader_opener, mpeg::reader_opener, apv::reader_opener]))
 }
 
 /// Openers that read containers through a [`filmcraft_media::ByteReader`] (index now, samples on
@@ -151,5 +173,7 @@ pub fn open_bytes(name: &str, bytes: Arc<[u8]>) -> std::result::Result<filmcraft
     filmcraft_media::open_bytes(name, bytes, &openers())
 }
 
+#[cfg(test)]
+mod rounded_pts_tests;
 #[cfg(test)]
 mod tests;

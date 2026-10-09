@@ -39,10 +39,13 @@ claude mcp add filmcraft-headless -- /abs/path/filmcraft/target/release/filmcraf
 |---|---|---|
 | `command_list` | both | every command: id, label, menu, shortcut, params, enabled now (`filter`, `enabled_only`) |
 | `command_run` | both | run a command `{id, params}`; edits are undoable |
+| `command_batch` | both | run several commands in order `{steps: [{id, params}], stop_on_error}` → `{completed, failed, results}` |
+| `doc_inspect` | both | the project tree and the active sequence in one call (`project_inspect` + `sequence_inspect`) |
+| `render_preview` | both | same as `render_frame` |
 | `project_inspect` | both | bins and items with ids, types, durations; active sequence |
-| `sequence_inspect` | both | the active sequence: tracks, clips (ticks and frames), effects, transitions, markers, playhead, selection |
+| `sequence_inspect` | both | the active sequence: tracks, clips (`start` / `end` and `sourceIn` / `sourceOut` in ticks, frames, `speed`, `reverse`: the clip plays its `sourceIn` to `sourceOut` stretch backward, `gainDb`), effects, transitions, markers (name and `comment`), playhead, selection |
 | `media_import` | both | import files by absolute path (`text`, one path per line) |
-| `render_frame` | both | PNG of the program frame at `seconds` (headless renders; bridge screenshots the Program monitor) |
+| `render_frame` | both | PNG of the program frame at `seconds` (headless renders; bridge screenshots the Program monitor). Read-only: the playhead and selection are left as they were |
 | `ui_inspect` | bridge | UI state: tool, workspace, panels, zoom, playback, fps |
 | `ui_elements` | bridge | on-screen interactive elements with id, label and rect (`prefix` filter) |
 | `ui_click` | bridge | click by `id` or `x`,`y`; `button`, `count`, `modifiers` |
@@ -54,6 +57,54 @@ claude mcp add filmcraft-headless -- /abs/path/filmcraft/target/release/filmcraf
 
 Typical loop: `project_inspect` / `sequence_inspect` → get ids → `command_run` → `render_frame` or
 `ui_screenshot` → look at the result → `edit.undo` if it's wrong.
+
+### Conventions
+
+The server follows a few conventions that make it predictable for agents. They are not
+FilmCraft-specific: the sibling craft apps' MCP servers can follow the same ones, so an agent that has
+driven one app can drive the others.
+
+- **Core tools.** `command_list`, `command_run`, `command_batch`, `doc_inspect` and `render_preview`
+  work in both modes. The FilmCraft tools above stay as they are.
+- **Titles and annotations.** Every tool has a `title` and the four MCP hints (`readOnlyHint`,
+  `destructiveHint`, `idempotentHint`, `openWorldHint`), so a client can let the read-only tools
+  (lists, inspects, renders, screenshots) run without asking and ask before edits. When you add a
+  tool, set them in its `#[tool(...)]` attribute; a test checks every listed tool.
+- **Strict arguments.** An unknown tool argument is a JSON-RPC `-32602` error that names it and the
+  accepted ones (`unknown argument "filtr" for command_list; expected: enabled_only, filter`), not a
+  silently ignored key. `command_run.params` goes to the command unchanged.
+- **Errors.** A failing command is an `isError` result with the engine's message. A line that is not
+  JSON gets a `-32700` parse error (id `null`) and the server keeps serving. A command that panics is
+  reported as `internal error: …`, and the session stays usable.
+- **Resources.** `filmcraft://document` (the project tree and active sequence, as `doc_inspect`) and
+  `filmcraft://commands` (the command catalog, as `command_list`), both `application/json`. For MCP
+  2026-07-28 clients such as current Claude Code, list and read results carry the `ttlMs` and
+  `cacheScope` hints that revision requires.
+
+### Long exports: progress and cancellation
+
+`command_run {"id": "file.exportMedia", "params": {…, "wait": true}}` in headless mode blocks until
+the file is written. It uses the MCP progress and cancellation utilities, so a client can show
+progress and stop it:
+
+- The export runs as the same background job `jobs.list` shows. The session is locked only for short
+  polls, so other requests (`ping`, `doc_inspect`, `jobs.list`, …) are answered while it encodes.
+- Every job in `jobs.list`, and every encoding item of `export.queue.list`, carries `etaSeconds`: the
+  time left at the job's speed over the last 15 seconds, `null` until a second of progress has been
+  measured (a loudness pass, a seek) and once it is done. The app shows it as `37% · 2:05 left` in the
+  status bar, the Export queue and the Progress panel.
+- With `"_meta": {"progressToken": T}` on the `tools/call`, the server sends
+  `notifications/progress` `{progressToken: T, progress: <frames done>, total: <frames>, message:
+  <job status>}` at most every 100 ms while frames advance. Without a token it sends none.
+- `notifications/cancelled` for the request stops the encode at the next batch (`jobs.cancel`),
+  deletes the partial output (the movie, or the frames and caption sidecar written so far) and sends
+  no response, as the MCP cancellation utility asks.
+- Without `wait` the command returns `{job, path}` at once, as before: poll `jobs.list` and stop it
+  with `jobs.cancel`. Other exports (`file.exportFrame`, interchange formats, …) finish quickly and
+  ignore the token.
+- Bridge mode works the same way: the export runs as an app job (the app stays responsive and shows
+  "Exporting… NN%" in its status bar) and the call returns when it is written, however long it
+  takes. `filmcraft-cli --bridge … exec file.exportMedia … wait=true` blocks the same way.
 
 ## 2. Control channel
 
@@ -89,10 +140,25 @@ Notes:
 
 - Time is in ticks (254 016 000 000 per second). Commands also accept `seconds`, `frame` or
   `timecode`.
+- A track parameter (`track`, `audioTrack`) is a track id or a name such as `"V1"` / `"A2"`.
+  Leaving it out picks the command's default track; naming a track the sequence does not have is
+  an "invalid parameters" error, never a different track.
+  In `timeline.place`, `track` is where the picture goes and `audioTrack` where the sound goes;
+  an audio track given as `track` places the sound alone, on that track.
 - `engine.execute` also runs UI-only commands (`tool.razor`, `playback.toggle`,
   `window.workspace.color`, `window.panel.<name>`).
+- A command that works on the selection is disabled ("no clips selected", "select a clip in the
+  Project panel") until something is selected, unless the call names its targets under a key the
+  command documents (`clips` / `clip` for timeline clips, `items` / `item` for project items):
+  `clip.replaceFromBin {"clips":[12],"item":4}` runs with nothing selected and leaves the
+  selection alone. Only the selection condition is answered by the named targets; every other
+  one (an open sequence, a filled clipboard, the right kind of clip) still applies, and ids of
+  nothing do not count. `command_list` / `engine.commands` keep reporting the selection's state.
 - Element ids come from the previous frame. If an element is missing right after a layout change,
   the app retries on later frames before giving up.
+- `timeline.move` takes linked partners along while Linked Selection is on: moving a picture
+  clip moves its sound by the same offset (pass `"linked": false` to move only the listed clips).
+  It returns `{"moved": [ids]}`, every clip that moved.
 - Without a window, `filmcraft-cli run script.jsonl` (lines of `{"id":"…","params":{…}}`) runs the
   same commands headlessly. See §2b for the rest of the CLI.
 
@@ -140,7 +206,8 @@ media, sidecar and `ATTRIBUTION.md` entry.
 
 1. [AGENTS.md](../AGENTS.md): absolute rules (assets, clean-room, licences).
 2. [CLAUDE.md](../CLAUDE.md): working instructions and non-negotiables.
-3. [ROADMAP.md](../ROADMAP.md): milestones, what's done, what's running.
+3. [ROADMAP.md](../ROADMAP.md): read the **honest assessment** and **Where we are lacking** first, then
+   milestones, what's done and what's running.
 4. [architecture.md](architecture.md), then the README and tests of the crate you'll touch.
 5. [contributing.md](contributing.md) (how to add things, gates) and [testing.md](testing.md).
 
@@ -151,7 +218,9 @@ everything you need to contribute is in the public docs above. Ask a maintainer 
 ## 5. Autonomous work loop
 
 1. **Orient.** Pick the next task: the next unchecked task in the maintainer status file, or an open
-   ROADMAP item. Read the relevant architecture section and crate README.
+   ROADMAP item. Prefer the gaps in ROADMAP's *Where we are lacking* (speed, correctness on real
+   media, measurement, Windows/Linux) over adding more checklist items. Read the relevant
+   architecture section and crate README.
 2. **Plan tests first.** Write down the acceptance test before writing code.
 3. **Implement and test.**
 4. **Verify.** Run all gates (`cargo xtask ci`). For UI work, run the app with `--control`, drive it
@@ -190,3 +259,15 @@ A feature is done when:
 - [ ] all gates pass (`cargo xtask ci`), and new assets have sidecars;
 - [ ] the crate README and ROADMAP.md are updated where relevant;
 - [ ] it is committed with its task id.
+
+### Reporting progress honestly
+
+ROADMAP.md keeps two numbers: the **feature checklist** (does it exist?) and **ready for real
+work** (does it hold up?). When you update either:
+
+- say how a number was obtained: *measured* (a test, a diff, a benchmark you ran) or *estimated*;
+- count an approximation, a stub or a partly wired setting as such, never as done;
+- record known bugs and limitations in the crate README and the honest assessment, not only
+  what works;
+- benchmarks state the machine, the load average and before/after on the same build;
+- don't raise a percentage without evidence a reviewer can rerun.

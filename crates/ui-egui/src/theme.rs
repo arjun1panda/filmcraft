@@ -124,7 +124,7 @@ impl Tokens {
             separator: Color32::from_rgb(0x30, 0x30, 0x30),
             row_alt: Color32::from_rgb(0x21, 0x21, 0x21),
             row_selected: Color32::from_rgb(0x33, 0x33, 0x33),
-            hot_text: Color32::from_rgb(0x57, 0x94, 0xec),
+            hot_text: Color32::from_rgb(0x40, 0x96, 0xf3),
             tl_bg: Color32::from_rgb(0x1d, 0x1d, 0x1d),
             tl_track_bg: Color32::from_rgb(0x1d, 0x1d, 0x1d),
             tl_track_bg_alt: Color32::from_rgb(0x1d, 0x1d, 0x1d),
@@ -139,7 +139,7 @@ impl Tokens {
             render_yellow: Color32::from_rgb(0xf0, 0xf0, 0x4f),
             render_green: Color32::from_rgb(0x2d, 0x9d, 0x78),
             monitor_bg: Color32::from_rgb(0x1d, 0x1d, 0x1d),
-            timecode: Color32::from_rgb(0x57, 0x94, 0xec),
+            timecode: Color32::from_rgb(0x40, 0x96, 0xf3),
             danger: Color32::from_rgb(0xdc, 0x51, 0x3d),
             radius: 0.0,
             radius_sm: 4.0,
@@ -228,9 +228,37 @@ impl Tokens {
     pub fn semibold(size: f32) -> FontId {
         FontId::new(size, FontFamily::Name("semibold".into()))
     }
+    /// The big blue timecode over the timeline and under the monitors: regular weight, as in
+    /// Premiere (Premiere's reads 10 px tall and 76 px wide for 00:00:16:05 at 1x).
+    pub fn timecode() -> FontId {
+        FontId::new(16.0, FontFamily::Proportional)
+    }
 }
 
-/// Install fonts (Inter, Inter SemiBold, JetBrains Mono) and egui visuals.
+/// Menu text: Premiere's menus are the system's, larger and brighter than panel text, one item
+/// every 24 px.
+pub const MENU_TEXT_SIZE: f32 = 13.0;
+pub const MENU_TEXT: Color32 = Color32::from_rgb(0xde, 0xde, 0xde);
+
+/// Style of the menu bar's menus and their submenus (on top of egui's own menu style).
+pub fn menu_style(s: &mut egui::Style) {
+    egui::containers::menu::menu_style(s);
+    s.text_styles.insert(TextStyle::Button, FontId::new(MENU_TEXT_SIZE, FontFamily::Proportional));
+    s.text_styles.insert(TextStyle::Body, FontId::new(MENU_TEXT_SIZE, FontFamily::Proportional));
+    s.spacing.item_spacing.y = 0.0;
+    if s.visuals.dark_mode {
+        s.visuals.override_text_color = Some(MENU_TEXT);
+    }
+}
+
+/// Every font family the theme defines (fallback fonts such as the Japanese fonts are added to each
+/// of them).
+pub fn font_families() -> Vec<FontFamily> {
+    vec![FontFamily::Proportional, FontFamily::Monospace, FontFamily::Name("semibold".into()), FontFamily::Name("medium".into())]
+}
+
+/// Install fonts (Inter, Inter SemiBold, JetBrains Mono, then the Japanese craft-fonts when built with
+/// `CRAFT_FONTS_DIR`) and egui visuals.
 pub fn install(ctx: &egui::Context, t: &Tokens) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("inter".into(), Arc::new(FontData::from_static(filmcraft_text::fonts::INTER_REGULAR)));
@@ -241,8 +269,30 @@ pub fn install(ctx: &egui::Context, t: &Tokens) {
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "jbmono".into());
     fonts.families.insert(FontFamily::Name("semibold".into()), vec!["inter-semibold".into(), "inter".into()]);
     fonts.families.insert(FontFamily::Name("medium".into()), vec!["inter-medium".into(), "inter".into()]);
+    add_craft_fonts(&mut fonts);
     ctx.set_fonts(fonts);
     apply_visuals(ctx, t);
+}
+
+/// Name of the egui font for a craft-fonts entry.
+fn craft_font_name(f: &filmcraft_text::fonts::CraftFont) -> String {
+    format!("craft:{} {}", f.family, f.style)
+}
+
+/// Append the Japanese craft-fonts (empty unless built with `CRAFT_FONTS_DIR`) as the last fallbacks
+/// of every font family, after the app's own fonts: BIZ UDPGothic first (bold before regular in
+/// the "semibold" and "medium" families), then the other Japanese faces.
+fn add_craft_fonts(fonts: &mut FontDefinitions) {
+    let jpan: Vec<_> = filmcraft_text::fonts::craft_japanese().collect();
+    for f in &jpan {
+        fonts.font_data.insert(craft_font_name(f), Arc::new(FontData::from_static(f.bytes)));
+    }
+    for (family, stack) in fonts.families.iter_mut() {
+        let heavy = matches!(family, FontFamily::Name(n) if matches!(n.as_ref(), "semibold" | "medium"));
+        let mut order = jpan.clone();
+        order.sort_by_key(|f| (!f.family.contains("Gothic"), (f.style == "Bold") != heavy));
+        stack.extend(order.iter().map(|f| craft_font_name(f)));
+    }
 }
 
 pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
@@ -293,4 +343,67 @@ pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
         s.text_styles.insert(TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace));
         s.animation_time = 0.12;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const JAPANESE: &str = "日本語の文字";
+
+    fn installed() -> egui::Context {
+        let ctx = egui::Context::default();
+        install(&ctx, &Tokens::for_kind(ThemeKind::default()));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        ctx
+    }
+
+    /// Built with craft-fonts: every font family ends with the Japanese faces (BIZ UDPGothic
+    /// first), and Japanese text gets real glyphs, not the replacement box.
+    #[test]
+    fn japanese_renders_with_craft_fonts() {
+        if filmcraft_text::fonts::craft_japanese().next().is_none() {
+            eprintln!("SKIPPED: built without craft-fonts (set CRAFT_FONTS_DIR to run)");
+            return;
+        }
+        let ctx = installed();
+        ctx.fonts_mut(|fonts| {
+            let defs = fonts.definitions().clone();
+            for (family, stack) in &defs.families {
+                let first = stack.iter().position(|n| n.starts_with("craft:")).unwrap_or(stack.len());
+                assert!(first > 0 && stack[first..].iter().all(|n| n.starts_with("craft:")), "{family:?}: {stack:?}");
+                assert!(stack[first].starts_with("craft:BIZ UDPGothic"), "{family:?}: {stack:?}");
+            }
+            for family in [FontFamily::Proportional, FontFamily::Monospace] {
+                let font = FontId::new(13.0, family);
+                for ch in JAPANESE.chars() {
+                    assert!(fonts.has_glyph(&font, ch), "missing {ch} in {font:?}");
+                }
+            }
+        });
+        // laid out and drawn: the replacement box (U+FFFD) would show as one glyph per character
+        // from the fallback face; a real face gives each character its own width
+        let galley = ctx.fonts_mut(|f| f.layout_no_wrap(JAPANESE.into(), FontId::new(13.0, FontFamily::Proportional), Color32::WHITE));
+        assert_eq!(galley.rows.iter().map(|r| r.glyphs.len()).sum::<usize>(), JAPANESE.chars().count());
+        assert!(galley.size().x > 13.0 * 4.0, "{:?}", galley.size());
+    }
+
+    /// Built without craft-fonts: the theme installs only the app's own fonts and Latin text
+    /// works as before.
+    #[test]
+    fn works_without_craft_fonts() {
+        let ctx = installed();
+        let n = filmcraft_text::fonts::craft_japanese().count();
+        ctx.fonts_mut(|fonts| {
+            let defs = fonts.definitions().clone();
+            assert_eq!(defs.font_data.keys().filter(|k| k.starts_with("craft:")).count(), n);
+            assert_eq!(defs.families[&FontFamily::Proportional].first().map(String::as_str), Some("inter"));
+            assert_eq!(defs.families[&FontFamily::Monospace].first().map(String::as_str), Some("jbmono"));
+            assert!(fonts.has_glyph(&FontId::new(13.0, FontFamily::Proportional), 'A'));
+            if n == 0 {
+                assert!(defs.families.values().flatten().all(|name| !name.starts_with("craft:")));
+            }
+        });
+    }
 }

@@ -128,6 +128,42 @@ pub(crate) fn tight_plane<T: Copy>(src: Vec<T>, stride: usize, w: usize, h: usiz
     out
 }
 
+/// Colour of an H.264 / HEVC picture from its VUI code points (ITU-T H.273), as the decoders
+/// report it: BT.709 by default with the matrix guessed from the size, the signalled matrix and
+/// transfer when known, and full range when flagged. Shared by the software and hardware
+/// decoders so the two are interchangeable.
+pub fn vui_color(width: u32, height: u32, matrix: u8, transfer: u8, full_range: bool) -> filmcraft_color::ColorInfo {
+    let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(width, height), ..filmcraft_color::ColorInfo::REC709 };
+    if let Some(m) = filmcraft_color::Matrix::from_code(matrix) {
+        color.matrix = m;
+    }
+    if let Some(t) = filmcraft_color::Transfer::from_code(transfer) {
+        color.transfer = t;
+    }
+    if full_range {
+        color.range = filmcraft_color::Range::Full;
+    }
+    color
+}
+
+/// Pixel aspect ratio from a VUI sample aspect ratio ((0, 0) = unspecified = square).
+pub fn sar_par(sar: (u16, u16)) -> (u32, u32) {
+    if sar.0 > 0 && sar.1 > 0 { (sar.0 as u32, sar.1 as u32) } else { (1, 1) }
+}
+
+/// NAL length-prefix size of an `avcC` record (byte 4: lengthSizeMinusOne).
+pub fn avcc_length_size(avcc: &[u8]) -> usize {
+    avcc.get(4).map_or(4, |b| (b & 3) as usize + 1)
+}
+
+/// NAL length-prefix size and highest TemporalId of an `hvcC` record.
+pub fn hvcc_length_size_and_tid(hvcc: &[u8]) -> (usize, Option<u8>) {
+    // hvcC byte 21: constantFrameRate(2) numTemporalLayers(3) temporalIdNested(1) lengthSizeMinusOne(2)
+    let length_size = hvcc.get(21).map_or(4, |b| (b & 3) as usize + 1);
+    let highest_tid = hvcc.get(21).map(|b| (b >> 3) & 7).filter(|&n| n > 0).map(|n| n - 1);
+    (length_size, highest_tid)
+}
+
 /// A factory returns `None` when it does not handle the entry.
 pub type VideoDecoderFactory = fn(&SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>>;
 
@@ -168,12 +204,14 @@ pub struct H264Decoder {
 
 impl H264Decoder {
     pub fn new(avcc: Vec<u8>) -> Result<Self> {
+        recycle_h264_planes();
         let dec = filmcraft_h264::Decoder::from_avcc(&avcc).map_err(|e| CodecError::Decode(e.to_string()))?;
-        let length_size = avcc.get(4).map_or(4, |b| (b & 3) as usize + 1);
+        let length_size = avcc_length_size(&avcc);
         Ok(Self { avcc, dec, length_size, draft: false })
     }
     /// A decoder for Annex B byte-stream samples (start codes, in-band parameter sets: MXF, TS).
     pub fn annexb() -> Self {
+        recycle_h264_planes();
         Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::new(), length_size: 0, draft: false }
     }
     fn convert(p: filmcraft_h264::Picture) -> DecodedFrame {
@@ -184,17 +222,8 @@ impl H264Decoder {
         let y = tight_plane(p.y, p.y_stride, w, h);
         let u = tight_plane(p.u, p.uv_stride, cw, ch);
         let v = tight_plane(p.v, p.uv_stride, cw, ch);
-        let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(p.width, p.height), ..filmcraft_color::ColorInfo::REC709 };
-        if let Some(m) = filmcraft_color::Matrix::from_code(p.color.matrix) {
-            color.matrix = m;
-        }
-        if let Some(t) = filmcraft_color::Transfer::from_code(p.color.transfer) {
-            color.transfer = t;
-        }
-        if p.color.full_range {
-            color.range = filmcraft_color::Range::Full;
-        }
-        let par = if p.sar.0 > 0 && p.sar.1 > 0 { (p.sar.0 as u32, p.sar.1 as u32) } else { (1, 1) };
+        let color = vui_color(p.width, p.height, p.color.matrix, p.color.transfer, p.color.full_range);
+        let par = sar_par(p.sar);
         let frame = VideoFrame {
             width: p.width,
             height: p.height,
@@ -242,6 +271,12 @@ impl VideoDecoder for H264Decoder {
     }
 }
 
+/// The H.264 decoder's output planes come from the frames the caches evicted
+/// (`filmcraft_frame::pool`) instead of the allocator.
+fn recycle_h264_planes() {
+    filmcraft_h264::set_plane_allocator(filmcraft_frame::pool::take_u8);
+}
+
 /// Worker threads each H.264 decoder uses (frame threading; 1 on wasm).
 pub fn h264_threads() -> usize {
     filmcraft_h264::default_threads()
@@ -265,9 +300,7 @@ pub struct HevcDecoder {
 impl HevcDecoder {
     pub fn new(hvcc: Vec<u8>) -> Result<Self> {
         let dec = filmcraft_hevc::Decoder::from_hvcc(&hvcc).map_err(|e| CodecError::Decode(e.to_string()))?;
-        // hvcC byte 21: constantFrameRate(2) numTemporalLayers(3) temporalIdNested(1) lengthSizeMinusOne(2)
-        let length_size = hvcc.get(21).map_or(4, |b| (b & 3) as usize + 1);
-        let highest_tid = hvcc.get(21).map(|b| (b >> 3) & 7).filter(|&n| n > 0).map(|n| n - 1);
+        let (length_size, highest_tid) = hvcc_length_size_and_tid(&hvcc);
         Ok(Self { hvcc, dec, length_size, highest_tid })
     }
     /// A decoder for Annex B byte-stream samples (start codes, in-band parameter sets: TS).
@@ -299,17 +332,8 @@ impl HevcDecoder {
                 alpha: None,
             },
         };
-        let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(p.width, p.height), ..filmcraft_color::ColorInfo::REC709 };
-        if let Some(m) = filmcraft_color::Matrix::from_code(p.color.matrix) {
-            color.matrix = m;
-        }
-        if let Some(t) = filmcraft_color::Transfer::from_code(p.color.transfer) {
-            color.transfer = t;
-        }
-        if p.color.full_range {
-            color.range = filmcraft_color::Range::Full;
-        }
-        let par = if p.sar.0 > 0 && p.sar.1 > 0 { (p.sar.0 as u32, p.sar.1 as u32) } else { (1, 1) };
+        let color = vui_color(p.width, p.height, p.color.matrix, p.color.transfer, p.color.full_range);
+        let par = sar_par(p.sar);
         let frame = VideoFrame { width: p.width, height: p.height, data, color, par, pts: filmcraft_time::Tick::ZERO };
         DecodedFrame { pts: p.pts, frame, draft: p.draft }
     }
@@ -388,32 +412,14 @@ impl Vp9Decoder {
 
     /// `None` for a picture whose planes mix sample types (never produced by the decoder).
     fn convert(&self, p: filmcraft_vp9::Picture) -> Option<DecodedFrame> {
-        use filmcraft_color::{Matrix, Primaries, Range};
+        use filmcraft_color::Range;
         use filmcraft_frame::{Chroma, PixelData};
         use filmcraft_vp9::Plane;
         use std::sync::Arc;
         let (w, h) = (p.width as usize, p.height as usize);
         let (cw, ch) = (p.chroma_width as usize, p.chroma_height as usize);
-        let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(p.width, p.height), ..filmcraft_color::ColorInfo::REC709 };
-        // color_space (7.2.2): 1 BT.601, 2 BT.709, 3 SMPTE-170, 4 SMPTE-240, 5 BT.2020, 7 sRGB.
-        match p.color.color_space {
-            1 | 3 => color.matrix = Matrix::Bt601,
-            2 | 4 => color.matrix = Matrix::Bt709,
-            5 => {
-                color.matrix = Matrix::Bt2020Ncl;
-                color.primaries = Primaries::Bt2020;
-            }
-            _ => {}
-        }
-        if let Some(t) = self.transfer {
-            color.transfer = t;
-        }
-        if let Some(pr) = self.primaries {
-            color.primaries = pr;
-        }
-        if p.color.full_range {
-            color.range = Range::Full;
-        }
+        // (shared with the hardware decoders: `hw_frame::vp9_color`)
+        let color = crate::hw_frame::vp9_color(p.width, p.height, p.color.color_space, p.color.full_range, self.transfer, self.primaries);
         let (pts, draft) = (p.pts, p.draft);
         if p.color.color_space == 7 {
             // RGB (profiles 1 / 3, 4:4:4): the planes carry G, B, R.
@@ -512,25 +518,8 @@ impl Av1Decoder {
         let draft = p.draft;
         let w = p.width as usize;
         let h = p.height as usize;
-        let mut color = filmcraft_color::ColorInfo::REC709;
-        if let Some(m) = filmcraft_color::Matrix::from_code(p.matrix_coefficients) {
-            color.matrix = m;
-        } else {
-            color.matrix = filmcraft_frame::default_matrix(p.width, p.height);
-        }
-        if let Some(t) = filmcraft_color::Transfer::from_code(p.transfer_characteristics) {
-            color.transfer = t;
-        }
-        color.primaries = match p.color_primaries {
-            9 => filmcraft_color::Primaries::Bt2020,
-            12 => filmcraft_color::Primaries::P3D65,
-            5 => filmcraft_color::Primaries::Bt601_625,
-            6 => filmcraft_color::Primaries::Bt601_525,
-            _ => filmcraft_color::Primaries::Bt709,
-        };
-        if p.full_range {
-            color.range = filmcraft_color::Range::Full;
-        }
+        // (shared with the hardware decoders: `hw_frame::av1_color`)
+        let color = crate::hw_frame::av1_color(p.width, p.height, p.matrix_coefficients, p.transfer_characteristics, p.color_primaries, p.full_range);
         let chroma = match (p.subsampling_x, p.subsampling_y) {
             (1, 1) => filmcraft_frame::Chroma::C420,
             (1, 0) => filmcraft_frame::Chroma::C422,
@@ -650,6 +639,72 @@ impl VideoDecoder for ProResDecoder {
 
 pub fn prores_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
     matches!(e.codec, CodecConfig::ProRes { .. }).then(|| Ok(Box::new(ProResDecoder) as Box<dyn VideoDecoder>))
+}
+
+/// Our APV (Advanced Professional Video, RFC 9924) decoder (every frame is intra; tiles decode in
+/// parallel).
+pub struct ApvDecoder;
+
+/// Convert a decoded APV frame to a [`VideoFrame`].
+pub fn apv_to_video_frame(f: filmcraft_apv::Frame) -> VideoFrame {
+    use std::sync::Arc;
+    let chroma = match f.chroma {
+        filmcraft_apv::ChromaFormat::Yuv422 => filmcraft_frame::Chroma::C422,
+        filmcraft_apv::ChromaFormat::Monochrome | filmcraft_apv::ChromaFormat::Yuv444 | filmcraft_apv::ChromaFormat::Yuv4444 => filmcraft_frame::Chroma::C444,
+    };
+    let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(f.width, f.height), ..filmcraft_color::ColorInfo::REC709 };
+    if let Some(m) = filmcraft_color::Matrix::from_code(f.color.matrix) {
+        color.matrix = m;
+    }
+    if let Some(t) = filmcraft_color::Transfer::from_code(f.color.transfer) {
+        color.transfer = t;
+    }
+    if let Some(p) = primaries_from_code(f.color.primaries) {
+        color.primaries = p;
+    }
+    if f.color.full_range {
+        color.range = filmcraft_color::Range::Full;
+    }
+    let neutral = 1u16 << f.bit_depth.saturating_sub(1);
+    let (cb, cr) = if f.chroma == filmcraft_apv::ChromaFormat::Monochrome {
+        let u = vec![neutral; (f.width as usize) * (f.height as usize)];
+        (u.clone(), u)
+    } else {
+        (f.cb, f.cr)
+    };
+    let data = if f.bit_depth == 8 {
+        let to8 = |p: Vec<u16>| Arc::new(p.into_iter().map(|v| v as u8).collect::<Vec<u8>>());
+        filmcraft_frame::PixelData::Yuv8 { planes: [to8(f.y), to8(cb), to8(cr)], chroma, alpha: f.alpha.map(to8) }
+    } else {
+        filmcraft_frame::PixelData::Yuv16 {
+            planes: [Arc::new(f.y), Arc::new(cb), Arc::new(cr)],
+            chroma,
+            bits: f.bit_depth as u32,
+            alpha: f.alpha.map(Arc::new),
+        }
+    };
+    VideoFrame { width: f.width, height: f.height, data, color, par: (1, 1), pts: filmcraft_time::Tick::ZERO }
+}
+
+impl VideoDecoder for ApvDecoder {
+    fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
+        let f = filmcraft_apv::decode_frame(sample).map_err(|e| CodecError::Decode(e.to_string()))?;
+        Ok(vec![DecodedFrame { pts, frame: apv_to_video_frame(f), draft: false }])
+    }
+    fn flush(&mut self) -> Vec<DecodedFrame> {
+        Vec::new()
+    }
+    fn reset(&mut self) {}
+    fn name(&self) -> &str {
+        "FilmCraft APV"
+    }
+    fn intra_only(&self) -> bool {
+        true
+    }
+}
+
+pub fn apv_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
+    matches!(e.codec, CodecConfig::Apv(_)).then(|| Ok(Box::new(ApvDecoder) as Box<dyn VideoDecoder>))
 }
 
 /// Our DNxHD / DNxHR (VC-3) decoder (every frame is intra; macroblock rows decode in parallel).

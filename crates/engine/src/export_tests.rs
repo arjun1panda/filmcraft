@@ -9,6 +9,20 @@ use serde_json::{Value, json};
 
 use crate::Session;
 
+#[test]
+fn hostile_export_ranges_are_rejected_without_panicking() {
+    let mut session = demo();
+    for params in [
+        json!({"range":"custom", "startTime":i64::MIN, "endTime":i64::MAX}),
+        json!({"range":"custom", "startTime":-1, "endTime":100}),
+        json!({"range":"custom", "startTime":100, "endTime":100}),
+    ] {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.execute("export.resolve", params)));
+        assert!(result.is_ok(), "a hostile export range must not panic");
+        assert!(result.unwrap().is_err());
+    }
+}
+
 /// A scratch directory under the workspace `target/`, removed when dropped.
 struct Scratch(PathBuf);
 
@@ -34,6 +48,20 @@ fn demo() -> Session {
     let mut s = Session::default();
     s.execute("file.openDemoProject", json!({})).unwrap();
     s
+}
+
+#[test]
+fn export_integer_parameters_cannot_wrap_or_overflow() {
+    let mut s = demo();
+    for name in ["bitrateKbps", "maxBitrateKbps", "keyframeDistance"] {
+        for value in [json!(-1), json!(1.5), json!(u64::from(u32::MAX) + 1)] {
+            let mut params = json!({});
+            params[name] = value;
+            assert!(s.execute("export.resolve", params).is_err(), "{name}");
+        }
+    }
+    assert!(s.execute("export.resolve", json!({"bitrateKbps":u32::MAX})).is_ok());
+    assert!(s.execute("export.resolve", json!({"bitrateKbps":8000.0, "keyframeDistance":48.0})).is_ok(), "integer-valued floats are integers");
 }
 
 fn probe(path: &str) -> Option<Value> {
@@ -177,6 +205,24 @@ fn every_builtin_preset_exports_and_ffprobe_confirms() {
                     _ => 220.0,
                 };
                 assert!((vbr / (mbps * px) - 1.0).abs() < 0.25, "{name}: {vbr:.1} Mb/s vs nominal {:.1}", mbps * px);
+                assert_eq!(a["codec_name"], "pcm_s24le", "{name}");
+            }
+            "apv" => {
+                assert!(fmt_name.contains("mov"), "{name}: {fmt_name}");
+                assert_eq!(v["codec_name"], "apv", "{name}");
+                let p = settings["apvProfile"].as_str().unwrap();
+                let idc = match p {
+                    "422-10" => "33",
+                    "422-12" => "44",
+                    "444-10" => "55",
+                    "444-12" => "66",
+                    "4444-10" => "77",
+                    "4444-12" => "88",
+                    "400-10" => "99",
+                    other => other,
+                };
+                let got_profile = v["profile"].as_str().unwrap_or("");
+                assert!(got_profile == p || got_profile == idc, "{name}: profile {got_profile} != {p} ({idc})");
                 assert_eq!(a["codec_name"], "pcm_s24le", "{name}");
             }
             "mxf-op1a" => {
@@ -343,6 +389,67 @@ fn queue_cancels_a_running_export_and_retries_a_failed_one() {
     assert_eq!(queue(&mut s).into_iter().find(|i| i["id"] == bad).unwrap()["status"], "ready");
     s.execute("export.queue.remove", json!({"id": bad})).unwrap();
     assert!(queue(&mut s).iter().all(|i| i["id"] != bad));
+}
+
+#[test]
+fn jobs_and_queue_items_report_the_time_they_have_left() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use crate::export_tools::QueueStatus;
+    let mut s = demo();
+    let dir = Scratch::new("eta");
+    let job = crate::Job { id: 77, label: "Exporting".into(), progress: Default::default(), result: Default::default() };
+    job.progress.total.store(1000, Ordering::Relaxed);
+    assert!(job.to_json()["etaSeconds"].is_null(), "no speed measured yet");
+    // 50 units a second for 5 s, read from the near future (the JSON reads the real clock, which is then behind them)
+    let t0 = web_time::Instant::now() + Duration::from_secs(60);
+    for i in 0..=50u64 {
+        job.progress.done.store(i * 5, Ordering::Relaxed);
+        job.progress.eta_at(t0 + Duration::from_millis(i * 100));
+    }
+    let eta = job.to_json()["etaSeconds"].as_f64().expect("a number once the job has a speed");
+    assert!((eta - 15.0).abs() < 0.5, "750 units left at 50 a second: {eta}");
+    s.jobs.push(job);
+
+    // a queue item encoding that job shows it; one that waits shows nothing
+    for name in ["a.wav", "b.wav"] {
+        s.execute(
+            "export.queue.add",
+            json!({"preset": "Waveform Audio 48 kHz 16-bit", "path": dir.path(name), "range": "custom", "startSeconds": 0, "endSeconds": 0.25}),
+        )
+        .unwrap();
+    }
+    s.export_queue.items[0].status = QueueStatus::Encoding;
+    s.export_queue.items[0].job = Some(77);
+    let items = queue(&mut s);
+    assert!((items[0]["etaSeconds"].as_f64().expect("encoding") - 15.0).abs() < 0.5, "{}", items[0]);
+    assert_eq!(items[0]["status"], "encoding");
+    assert!(items[1]["etaSeconds"].is_null(), "{}", items[1]);
+    // and `jobs.list` carries it too
+    let jobs = s.execute("jobs.list", json!({})).unwrap();
+    let listed = jobs["jobs"].as_array().or(jobs.as_array()).expect("a list of jobs").iter().find(|j| j["id"] == 77).cloned().expect("the job is listed");
+    assert!(listed["etaSeconds"].as_f64().is_some(), "{listed}");
+}
+
+#[test]
+fn hardware_encoding_is_off_unless_asked_for() {
+    use filmcraft_export::HardwareEncoding::{Auto, Off};
+    let s = demo();
+    let setting = |p: Value| crate::export_tools::settings_from_params(&s, &p, "file.exportMedia").map(|(_, st)| st.hardware_encoding);
+    assert_eq!(setting(json!({"path": "x.mp4"})).unwrap(), Off);
+    assert_eq!(setting(json!({"path": "x.mp4", "hardwareEncoding": "auto"})).unwrap(), Auto);
+    assert_eq!(setting(json!({"path": "x.mp4", "hardwareEncoding": "off"})).unwrap(), Off);
+    // a boolean is understood too: true is auto
+    assert_eq!(setting(json!({"path": "x.mp4", "hardwareEncoding": true})).unwrap(), Auto);
+    assert_eq!(setting(json!({"path": "x.mp4", "hardwareEncoding": false})).unwrap(), Off);
+    // anything else names the choices
+    let e = setting(json!({"path": "x.mp4", "hardwareEncoding": "gpu"})).unwrap_err().to_string();
+    assert!(e.contains("off | auto"), "{e}");
+    // and it travels in the settings object, with the default filling in when it is missing
+    assert_eq!(setting(json!({"path": "x.mp4", "settings": {"hardwareEncoding": "auto"}})).unwrap(), Auto);
+    let old: filmcraft_export::ExportSettings = serde_json::from_value(json!({"format": "h264"})).unwrap();
+    assert_eq!(old.hardware_encoding, Off);
 }
 
 #[test]

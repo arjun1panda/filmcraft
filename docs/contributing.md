@@ -38,9 +38,33 @@ cargo xtask web --serve 8765                          # the web app on http://12
 
 `FILMCRAFT_CONTROL_PORT=9876` works like `--control 9876`, and `FILMCRAFT_CPU_COMPOSITE=1`
 disables the GPU compositor.
+`filmcraft --help` lists the app's options. An option it does not know, or a control port that is
+not a number (from `--control` or from `FILMCRAFT_CONTROL_PORT`), is an error on stderr with exit
+code 2 instead of a window.
 
 Dev builds compile dependencies at `opt-level = 2` and workspace crates at `opt-level = 1`. For
 playback and codec speed, use `--release`.
+
+### Building with craft-fonts
+
+Font assets live in [storytold/craft-fonts](https://github.com/storytold/craft-fonts), never in this
+repo ([standard](https://github.com/storytold/craftrules/blob/main/standards/fonts.md)). It is an optional build input, not a Cargo
+dependency:
+
+```sh
+git clone https://github.com/storytold/craft-fonts ../craft-fonts
+CRAFT_FONTS_DIR="$PWD/../craft-fonts" cargo run --release -p filmcraft
+```
+
+Use an absolute path: `build.rs` runs in `crates/text`, so a relative `CRAFT_FONTS_DIR` would
+resolve from there. `crates/text/build.rs` reads its `fonts/manifest.txt` and embeds the fonts as
+`filmcraft_text::fonts::CRAFT_FONTS` (native: all of them; the web build: only BIZ UDPGothic
+Regular, to keep the wasm small). The Japanese ones become the last fallback of every UI font family
+(`crates/ui-egui/src/theme.rs`, BIZ UDPGothic first) and fallback faces in the text engine (Gothic
+for sans text, Mincho for serif text). Without `CRAFT_FONTS_DIR`, `CRAFT_FONTS` is empty and
+FilmCraft uses its bundled and system fonts. A `CRAFT_FONTS_DIR` that is not a checkout is a build
+warning, or an error with `CRAFT_FONTS_REQUIRED=1` (release builds set both). Tests on these fonts'
+glyphs skip when it is empty; when you touch fonts, run the gates both with and without it.
 
 ## 3. Quality gates
 
@@ -55,6 +79,8 @@ Every commit must pass all of these:
 | Assets | `cargo xtask assets` |
 | wasm | `cargo xtask wasm` (checks every L0–L4 crate, `filmcraft-ui-egui` and `filmcraft-web` for `wasm32-unknown-unknown`) |
 | All of the above | `cargo xtask ci` (runs clippy and tests with `--release`) |
+
+Run them with `CRAFT_FONTS_DIR` set too when you change font code ([craft-fonts](#building-with-craft-fonts)).
 
 `cargo xtask` is an alias in `.cargo/config.toml` for `cargo run -p xtask --`.
 
@@ -133,6 +159,10 @@ export CARGO_TARGET_DIR=target/agent-hevc     # separate build dir, no lock figh
    so reduced-resolution playback matches full resolution. Unknown ids are a no-op.
 3. Add a test in `crates/render/src/tests.rs`.
 4. The GPU path needs no change: `render::plan` pre-renders layers with standard effects on the CPU.
+   To run it on the GPU too, make it an `FxOp` in `crates/render/src/gpufx.rs` instead (parameter
+   evaluation in `FxOp::eval`, the CPU reference in `FxOp::apply`, the id in `GPU_EFFECTS`), add
+   its passes to `crates/gpu/src/fx.rs` and its math to `fx.wgsl`, and a parity case to
+   `crates/gpu/src/fx_tests.rs`.
 
 Audio effects implement `AudioEffect` in `crates/audio-dsp` and register in its `effects()`
 registry. Then add an `audio(…)` definition in `effect.rs` and a `Mapping` from project parameters
@@ -201,6 +231,12 @@ In short:
   work under MIT OR Apache-2.0). No NC or ND licences. If the licence is unclear, leave the asset out.
 - Screenshots show only FilmCraft (or other open projects) with media we generated or that is
   openly licensed.
+
+- **Fonts live in [storytold/craft-fonts](https://github.com/storytold/craft-fonts), not here.**
+  Don't commit new font files to this repo (the Latin UI fonts already in `assets/fonts/` stay): add
+  the font to craft-fonts (file, licence, manifest line, `ATTRIBUTION.md` row) and use it through
+  `filmcraft_text::fonts::CRAFT_FONTS`. See [Building with craft-fonts](#building-with-craft-fonts)
+  and [`craftrules/standards/fonts.md`](https://github.com/storytold/craftrules/blob/main/standards/fonts.md).
 
 For each asset file `X`, commit a sidecar `X.attribution`. This is the real one for
 `assets/fonts/Inter-Regular.ttf`:

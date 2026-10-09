@@ -237,9 +237,15 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             can_replace_from_source,
             |s, p| replace_with(s, p, Replace::MatchFrame),
         ),
-        spec("clip.replaceFromBin", "From Bin", &["Clip", "Replace With Clip"], None, r#"{"clips":[id]?,"item":id?}"#, can_replace_from_bin, |s, p| {
-            replace_with(s, p, Replace::Bin)
-        }),
+        spec(
+            "clip.replaceFromBin",
+            "From Bin",
+            &["Clip", "Replace With Clip"],
+            None,
+            r#"{"clips":[id]?,"item":id?,"keepSourceIn":bool=false}"#,
+            can_replace_from_bin,
+            |s, p| replace_with(s, p, Replace::Bin),
+        ),
     ]
 }
 
@@ -417,11 +423,7 @@ fn can_replace_from_bin(s: &Session) -> std::result::Result<(), String> {
 
 /// The media item behind `id` (subclips resolve to their parent) and the subclip range.
 fn media_root(p: &Project, id: ItemId) -> Option<(ItemId, &MediaClip, Option<TimeRange>)> {
-    match &p.item(id)?.kind {
-        ItemKind::Media(m) => Some((id, m, None)),
-        ItemKind::Subclip { parent, range, .. } => media_root(p, *parent).map(|(i, m, _)| (i, m, Some(*range))),
-        _ => None,
-    }
+    p.resolve_media(id)
 }
 
 /// What the Source monitor shows for an item: the media-time span of its time ruler, its frame
@@ -1664,12 +1666,22 @@ fn replace_with(s: &mut Session, p: &Value, how: Replace) -> Result<Value> {
         Replace::Bin => item_range(&s.project, new_item, s.prefs.timeline.still_duration(s.sequence_rate())).map(|r| r.start).unwrap_or_default(),
         _ => source_range(s).map(|(_, r)| r.start).unwrap_or_default(),
     };
+    // From Bin starts at the item's In point, as Premiere does; `keepSourceIn` keeps each clip's own
+    let keep_in = how == Replace::Bin && bool_p(p, "keepSourceIn").unwrap_or(false);
+    // ...but a subclip that restricts trims has no media outside its range: a kept In stays on
+    // one of its frames (first frame, last frame)
+    let keep_within = match &pi.kind {
+        ItemKind::Subclip { range, restrict_trims: true, .. } => {
+            Some((range.start, (range.end() - item_rate(&s.project, new_item).frame_duration()).max(range.start)))
+        }
+        _ => None,
+    };
     let src_ph = s.state.source_playhead;
     let ph = s.playhead();
     let targets = with_links(s, &clips_p(s, p));
     let src_channels = pi.as_media().and_then(|m| m.interpret.audio_channels.as_ref()).and_then(|a| a.clips.first().cloned()).unwrap_or_default();
-    let replaced = s.edit_sequence("Replace With Clip", |q, _, _| {
-        let mut out = Vec::new();
+    let (replaced, clamped) = s.edit_sequence("Replace With Clip", |q, _, _| {
+        let (mut out, mut clamped) = (Vec::new(), Vec::new());
         for c in &targets {
             let Some((tid, _)) = q.find_item(*c) else { continue };
             let kind = q.track(tid).map(|t| t.kind).unwrap_or_default();
@@ -1680,6 +1692,13 @@ fn replace_with(s: &mut Session, p: &Value, how: Replace) -> Result<Value> {
             let src_in = match how {
                 // the Source monitor frame lines up with the sequence playhead
                 Replace::MatchFrame => src_ph - Tick(((ph - it.start).0 as f64 * it.speed.abs()).round() as i64),
+                _ if keep_in => {
+                    let kept = keep_within.map(|(first, last)| it.source_in.clamp(first, last)).unwrap_or(it.source_in);
+                    if kept != it.source_in {
+                        clamped.push(c.0);
+                    }
+                    kept
+                }
                 _ => in_point,
             };
             if src_in < Tick::ZERO {
@@ -1699,7 +1718,37 @@ fn replace_with(s: &mut Session, p: &Value, how: Replace) -> Result<Value> {
         if out.is_empty() {
             return Err(EngineError::Other("the replacement has no video or audio for the selected clips".into()));
         }
-        Ok(out)
+        Ok((out, clamped))
     })?;
-    Ok(json!({"clips": replaced, "item": new_item.0}))
+    let mut result = json!({"clips": replaced, "item": new_item.0, "short": short_clips(s, &replaced)});
+    if keep_in {
+        // the clips whose In was outside a trims-restricted subclip and now sits on its nearest frame
+        result["sourceInClamped"] = json!(clamped);
+    }
+    Ok(result)
+}
+
+/// The clips among `clips` that play past the end of their media, with how many sequence frames
+/// of the clip have no media (at most the clip's own length). The edit is left as it is (the
+/// renderer holds the last frame there); this is so whoever replaced the clip knows.
+fn short_clips(s: &Session, clips: &[u64]) -> Vec<Value> {
+    let Some(q) = s.active_sequence() else { return Vec::new() };
+    let frame = q.settings.frame_rate.frame_duration().0.max(1);
+    clips
+        .iter()
+        .filter_map(|c| {
+            let (_, it) = q.find_item(ClipId(*c))?;
+            // stills, mattes and other sources without an end are never short; nor is a held frame
+            let media_end = crate::media_duration(&s.project, &s.media, it.item)?;
+            let over = it.source_out().0.saturating_sub(media_end.0);
+            if over <= 0 || it.frame_hold.is_some() {
+                return None;
+            }
+            // media ticks past the end, as sequence ticks of this clip
+            let length = it.duration.0.max(0);
+            let ticks = ((over as f64 / it.speed.abs().max(1e-9)).round().min(length as f64) as i64).min(length);
+            let frames = ticks.saturating_add(frame - 1) / frame;
+            (frames > 0).then(|| json!({"clip": c, "shortByFrames": frames}))
+        })
+        .collect()
 }

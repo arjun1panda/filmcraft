@@ -35,8 +35,9 @@ pub enum EditError {
     NoTrack(TrackId),
     #[error("track is locked")]
     Locked,
-    #[error("this edit would break sync on a sync-locked track")]
-    SyncLockConflict,
+    /// Names the sync-locked track (`A2`) whose clip is in the way.
+    #[error("this edit would break sync: {0} is sync-locked and has a clip in the way (turn off its sync lock, or lock the track, to make this edit)")]
+    SyncLockConflict(String),
     #[error("not enough media (handles) for this trim")]
     NoHandles,
     #[error("edit would make a clip shorter than one frame")]
@@ -351,21 +352,77 @@ pub fn delete_items(seq: &mut Sequence, items: &[ClipId]) -> usize {
     n
 }
 
-/// Ripple delete track items: remove them and close the resulting gaps.
-pub fn ripple_delete_items(seq: &mut Sequence, items: &[ClipId]) -> Result<()> {
-    // Collect per-track ranges to close (merged), processed right-to-left.
-    let mut ranges: Vec<(TrackId, TimeRange)> = Vec::new();
-    for c in items {
-        let (tid, it) = seq.find_item(*c).ok_or(EditError::NoItem(*c))?;
-        ranges.push((tid, it.range()));
+/// The stretches a ripple delete of `items` closes, in time order: the time the deleted items
+/// covered, less whatever stays on the tracks that lose an item. Every such track then moves up
+/// by the same amount, into time that is free on all of them, so later clips stay in sync and
+/// nothing is overwritten. A clip and its linked sound with a split edit have different edges;
+/// closing each one's own range would move the tracks twice. Locked tracks lose nothing and do
+/// not count.
+fn ripple_delete_spans(seq: &Sequence, items: &[ClipId]) -> Vec<TimeRange> {
+    let (mut deleted, mut kept) = (Vec::new(), Vec::new());
+    for tr in seq.all_tracks().filter(|t| !t.locked && t.items.iter().any(|i| items.contains(&i.id))) {
+        for i in &tr.items {
+            if items.contains(&i.id) { deleted.push(i.range()) } else { kept.push(i.range()) }
+        }
     }
-    // Group identical ranges across tracks (linked A/V) into one ripple.
-    let mut spans: Vec<TimeRange> = ranges.iter().map(|r| r.1).collect();
-    spans.sort_by_key(|r| (r.start, r.duration));
-    spans.dedup();
+    let kept = merged(kept);
+    let mut spans = Vec::new();
+    for r in merged(deleted) {
+        let mut at = r.start;
+        for k in kept.iter().filter(|k| k.overlaps(&r)) {
+            if k.start > at {
+                spans.push(TimeRange::from_bounds(at, k.start));
+            }
+            at = at.max(k.end());
+        }
+        if at < r.end() {
+            spans.push(TimeRange::from_bounds(at, r.end()));
+        }
+    }
+    spans
+}
+
+/// How the UI names a track: `V1`, `A2` (by position), else its name.
+pub fn track_label(seq: &Sequence, id: TrackId) -> String {
+    if let Some(i) = seq.video_tracks.iter().position(|t| t.id == id) {
+        return format!("V{}", i + 1);
+    }
+    if let Some(i) = seq.audio_tracks.iter().position(|t| t.id == id) {
+        return format!("A{}", i + 1);
+    }
+    seq.track(id).map(|t| t.name.clone()).unwrap_or_else(|| format!("track {}", id.0))
+}
+
+/// `ranges` in time order, with the ones that touch or overlap joined.
+fn merged(mut ranges: Vec<TimeRange>) -> Vec<TimeRange> {
+    ranges.sort_by_key(|r| r.start);
+    let mut out: Vec<TimeRange> = Vec::new();
+    for r in ranges {
+        match out.last_mut() {
+            Some(last) if r.start <= last.end() => *last = TimeRange::from_bounds(last.start, last.end().max(r.end())),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// Ripple delete track items: remove them and close the resulting gaps. Returns the stretches
+/// that were closed, in time order. Refused when no gap can close (what stays on the items'
+/// tracks covers all of their time): that would be a plain delete.
+pub fn ripple_delete_items(seq: &mut Sequence, items: &[ClipId]) -> Result<Vec<TimeRange>> {
+    // Collect the tracks that lose an item; the gaps close right-to-left.
+    let mut affected: Vec<TrackId> = Vec::new();
+    for c in items {
+        let (tid, _) = seq.find_item(*c).ok_or(EditError::NoItem(*c))?;
+        affected.push(tid);
+    }
+    let spans = ripple_delete_spans(seq, items);
+    if spans.is_empty() && !items.is_empty() {
+        let locked = affected.iter().all(|t| seq.track(*t).is_some_and(|tr| tr.locked));
+        return Err(if locked { EditError::Locked } else { EditError::Other("no gap can close: other clips on these tracks cover the deleted time".into()) });
+    }
     let mut work = seq.clone();
     delete_items(&mut work, items);
-    let affected: Vec<TrackId> = ranges.iter().map(|r| r.0).collect();
     for span in spans.iter().rev() {
         // the gap actually closable: from span.start to the next material on affected tracks
         for tr in work.all_tracks_mut() {
@@ -377,13 +434,13 @@ pub fn ripple_delete_items(seq: &mut Sequence, items: &[ClipId]) -> Result<()> {
                 continue;
             }
             if !on_affected && !track_range_empty(tr, *span) {
-                return Err(EditError::SyncLockConflict);
+                return Err(EditError::SyncLockConflict(track_label(seq, tr.id)));
             }
             shift_track_from(tr, span.end(), -span.duration);
         }
     }
     *seq = work;
-    Ok(())
+    Ok(spans)
 }
 
 /// Close the gap containing `t` on a track (Ripple Delete on a gap).
@@ -405,7 +462,7 @@ pub fn close_gap(seq: &mut Sequence, track: TrackId, t: Tick) -> Result<()> {
                 continue;
             }
             if !track_range_empty(tr, gap) {
-                return Err(EditError::SyncLockConflict);
+                return Err(EditError::SyncLockConflict(track_label(seq, tr.id)));
             }
         }
         shift_track_from(tr, gap.end(), -gap.duration);
@@ -505,6 +562,7 @@ pub fn trim(seq: &mut Sequence, clip: ClipId, edge: Edge, mode: TrimMode, delta:
     let (tid, it) = seq.find_item(clip).ok_or(EditError::NoItem(clip))?;
     let old_end = it.end();
     let old_start = it.start;
+    let own_link = it.link;
     let speed = it.speed.abs();
     let mut work = seq.clone();
     {
@@ -537,9 +595,13 @@ pub fn trim(seq: &mut Sequence, clip: ClipId, edge: Edge, mode: TrimMode, delta:
                 continue;
             }
             if tr.id == tid || tr.sync_lock {
-                if tr.id != tid && shift < Tick::ZERO && !track_range_empty(tr, TimeRange::new(at + shift - Tick(if edge == Edge::In { 1 } else { 0 }), -shift))
-                {
-                    return Err(EditError::SyncLockConflict);
+                // the stretch that closes: a shorter head takes it from just after the cut, a
+                // shorter tail from just before it
+                let closing = if edge == Edge::In { TimeRange::new(old_start, -shift) } else { TimeRange::new(at + shift, -shift) };
+                // (the clip's own linked partners are the caller's to trim or leave)
+                let in_the_way = tr.items.iter().any(|i| i.range().overlaps(&closing) && (own_link.is_none() || i.link != own_link));
+                if tr.id != tid && shift < Tick::ZERO && in_the_way {
+                    return Err(EditError::SyncLockConflict(track_label(seq, tr.id)));
                 }
                 let from = if edge == Edge::In { old_start + Tick(1) } else { old_end };
                 for i in &mut tr.items {
@@ -559,8 +621,9 @@ pub fn trim(seq: &mut Sequence, clip: ClipId, edge: Edge, mode: TrimMode, delta:
 
 /// Ripple-trim one edge of a group of linked items (e.g. a clip and its audio partners) as a single
 /// edit: every member's edge moves by the same delta, later material on the members' tracks and on
-/// sync-locked tracks shifts by the change. Only tracks without a group member can block the edit
-/// (a sync-locked track whose material would be overwritten).
+/// sync-locked tracks shifts by the change, and so does a clip that starts before the cut, reaches
+/// past it and is linked to a clip that shifts (a split edit). The edit is refused when it would
+/// overwrite material on a sync-locked track, or when such a linked clip has no room to follow.
 pub fn ripple_trim_group(seq: &mut Sequence, clips: &[ClipId], edge: Edge, delta: Tick, ctx: &mut EditCtx) -> Result<Tick> {
     let Some(&first) = clips.first() else { return Ok(Tick::ZERO) };
     let mut d = delta;
@@ -601,32 +664,75 @@ pub fn ripple_trim_group(seq: &mut Sequence, clips: &[ClipId], edge: Edge, delta
             origins.push((tid, from));
         }
     }
-    let main_from = {
+    // a shorter or longer head: the cut is the latest member's start (a sound that leads its picture
+    // starts earlier), whichever member was grabbed
+    let main_from = if edge == Edge::In {
+        origins.iter().map(|o| o.1).max().unwrap_or_default()
+    } else {
         let (tid, _) = seq.find_item(first).ok_or(EditError::NoItem(first))?;
         origins.iter().find(|(t, _)| *t == tid).map(|o| o.1).unwrap_or_default()
     };
     let shift = if edge == Edge::In { -d } else { d };
-    for tr in work.all_tracks_mut() {
-        if tr.locked {
-            continue;
-        }
-        let member = origins.iter().find(|(t, _)| *t == tr.id).map(|o| o.1);
-        if member.is_none() && !tr.sync_lock {
-            continue;
-        }
-        let from = member.unwrap_or(main_from);
-        if member.is_none() && shift < Tick::ZERO {
-            let at = if edge == Edge::In { from - Tick(1) } else { from };
-            if !track_range_empty(tr, TimeRange::new(at + shift, -shift)) {
-                return Err(EditError::SyncLockConflict);
+    // where the shift starts on each track that ripples: the members' tracks and the sync-locked ones
+    let rippling: Vec<(TrackId, Tick, bool)> = work
+        .all_tracks()
+        .filter(|tr| !tr.locked)
+        .filter_map(|tr| match origins.iter().find(|(t, _)| *t == tr.id) {
+            Some(o) => Some((tr.id, o.1, true)),
+            None => tr.sync_lock.then_some((tr.id, main_from, false)),
+        })
+        .collect();
+    // A split edit: the linked partner of a later clip can start before the shift does and reach
+    // past it (its sound leads the cut). It follows the clip it is linked to, or the two would
+    // drift apart.
+    // (the trimmed clips' own partners are trimmed, or left alone, by the caller: they never follow)
+    let own_links: Vec<u64> = clips.iter().filter_map(|c| work.find_item(*c).and_then(|(_, i)| i.link)).collect();
+    let mut shifting_links: Vec<u64> = Vec::new();
+    for (tid, from, _) in &rippling {
+        let Some(tr) = work.track(*tid) else { continue };
+        let later = tr.items.iter().filter(|i| !clips.contains(&i.id) && i.start >= *from);
+        shifting_links.extend(later.filter_map(|i| i.link).filter(|l| !own_links.contains(l)));
+    }
+    // every linked clip: its link, and where it is and ends
+    let linked: Vec<(u64, ClipId, Tick)> = work.all_tracks().flat_map(|tr| tr.items.iter().filter_map(|i| i.link.map(|l| (l, i.id, i.end())))).collect();
+    for (tid, from, member) in rippling {
+        let Some(tr) = work.track_mut(tid) else { continue };
+        let follows = |i: &TrackItem| i.start < from && i.end() > from && i.link.is_some_and(|l| shifting_links.contains(&l));
+        // An L cut: the sound of a clip that ends at the cut runs on into the shortened head. That clip
+        // stays put, so its sound stays with it and the L cut still ends where it did. (Unlinked material
+        // across the cut, a music bed, still refuses, and so does a linked clip whose partner reaches past
+        // the cut.)
+        let stays = |i: &TrackItem| {
+            let cut = from - Tick(1);
+            let mut partners = linked.iter().filter(|p| Some(p.0) == i.link && p.1 != i.id).peekable();
+            edge == Edge::In && i.start < cut && i.link.is_some_and(|l| !own_links.contains(&l)) && partners.peek().is_some() && partners.all(|p| p.2 <= cut)
+        };
+        if !member && shift < Tick::ZERO {
+            // a shorter head closes the stretch just after the cut, a shorter tail the one before it
+            let closing = if edge == Edge::In { TimeRange::new(from - Tick(1), -shift) } else { TimeRange::new(from + shift, -shift) };
+            let own = |i: &TrackItem| i.link.is_some_and(|l| own_links.contains(&l));
+            if tr.items.iter().any(|i| i.range().overlaps(&closing) && !follows(i) && !own(i) && !stays(i)) {
+                return Err(EditError::SyncLockConflict(track_label(seq, tid)));
             }
         }
+        let followers: Vec<ClipId> = tr.items.iter().filter(|i| !clips.contains(&i.id) && follows(i)).map(|i| i.id).collect();
         for i in &mut tr.items {
-            if !clips.contains(&i.id) && i.start >= from {
+            if !clips.contains(&i.id) && (i.start >= from || followers.contains(&i.id)) {
                 i.start += shift;
             }
         }
         tr.sort();
+        // a transition into a follower from a clip that stayed behind no longer sits on a cut
+        let ends: Vec<(ClipId, Tick)> = tr.items.iter().map(|i| (i.id, i.end())).collect();
+        let starts: Vec<(ClipId, Tick)> = tr.items.iter().map(|i| (i.id, i.start)).collect();
+        tr.transitions.retain(|t| match (t.from, t.to) {
+            (Some(a), Some(b)) if followers.contains(&b) => ends.iter().find(|e| e.0 == a).map(|e| e.1) == starts.iter().find(|x| x.0 == b).map(|x| x.1),
+            _ => true,
+        });
+        // a follower with no room (a clip in its way, or the sequence start) blocks the edit
+        if tr.items.first().is_some_and(|i| i.start < Tick::ZERO) || tr.items.windows(2).any(|w| w[0].end() > w[1].start) {
+            return Err(EditError::SyncLockConflict(track_label(seq, tr.id)));
+        }
     }
     transitions_follow_cuts(seq, &mut work);
     work.check().map_err(EditError::Other)?;
@@ -751,41 +857,71 @@ pub fn rate_stretch(seq: &mut Sequence, clip: ClipId, edge: Edge, delta: Tick, c
 
 /// Set speed/duration (Clip ▸ Speed/Duration…). `ripple` shifts following material.
 pub fn set_speed(seq: &mut Sequence, clip: ClipId, speed: f64, reverse: bool, ripple: bool, ctx: &mut EditCtx) -> Result<()> {
-    if speed <= 0.0 {
+    set_speed_group(seq, &[clip], speed, reverse, ripple, ctx)
+}
+
+/// Speed/Duration on a clip and its linked partners on other tracks (its sound) as a single edit.
+/// `clips` holds at most one clip per track. Every member takes the speed, and with `ripple` the
+/// later material moves once, on the members' tracks and on sync-locked tracks. Rippling each
+/// member on its own would move the later clips once per member. When the members' lengths change
+/// by different amounts (a split edit), the later material moves by the largest change, so no
+/// member is overlapped and the tracks stay in sync. Nothing changes when the edit fails.
+pub fn set_speed_group(seq: &mut Sequence, clips: &[ClipId], speed: f64, reverse: bool, ripple: bool, ctx: &mut EditCtx) -> Result<()> {
+    if !(speed.is_finite() && speed > 0.0) {
         return Err(EditError::Other("speed must be positive".into()));
     }
-    let (tid, it) = seq.find_item(clip).ok_or(EditError::NoItem(clip))?;
-    let src_len = it.source_out() - it.source_in;
-    let mut new_dur = Tick((src_len.0 as f64 / speed).round() as i64).max(ctx.min_duration);
-    let old_end = it.end();
-    let tr = seq.track(tid).ok_or(EditError::NoTrack(tid))?;
-    let (_, next_start) = neighbours(tr, clip);
-    if !ripple {
-        new_dur = new_dur.min(next_start - it.start);
-    }
-    let delta = new_dur - it.duration;
-    let before = ripple.then(|| seq.clone());
-    {
-        let (_, it) = seq.find_item_mut(clip).ok_or(EditError::NoItem(clip))?;
+    let mut work = seq.clone();
+    // per member track: where its later material starts, and by how much the member's length changed
+    let mut origins: Vec<(TrackId, Tick, Tick)> = Vec::new();
+    for clip in clips {
+        let (tid, it) = work.find_item(*clip).ok_or(EditError::NoItem(*clip))?;
+        if origins.iter().any(|o| o.0 == tid) {
+            return Err(EditError::Other("clips on one track change speed one at a time".into()));
+        }
+        let src_len = it.source_out() - it.source_in;
+        // a tiny speed saturates the cast: keep the clip's end representable
+        let room = Tick(Tick::MAX.0.saturating_sub(it.start.0.max(0)));
+        let mut new_dur = Tick((src_len.0 as f64 / speed).round() as i64).min(room).max(ctx.min_duration);
+        let old_end = it.end();
+        let tr = work.track(tid).ok_or(EditError::NoTrack(tid))?;
+        let (_, next_start) = neighbours(tr, *clip);
+        if !ripple {
+            new_dur = new_dur.min(next_start - it.start);
+        }
+        let delta = new_dur - it.duration;
+        let (_, it) = work.find_item_mut(*clip).ok_or(EditError::NoItem(*clip))?;
         it.speed = speed;
         it.reverse = reverse;
         it.duration = new_dur;
+        origins.push((tid, old_end, delta));
     }
-    if ripple && delta != Tick::ZERO {
-        for tr in seq.all_tracks_mut() {
-            if !tr.locked && (tr.id == tid || tr.sync_lock) {
-                for i in &mut tr.items {
-                    if i.id != clip && i.start >= old_end {
-                        i.start += delta;
-                    }
-                }
-                tr.sort();
+    let main_from = origins.first().map(|o| o.1).unwrap_or_default();
+    let shift = origins.iter().map(|o| o.2).max().unwrap_or_default();
+    if ripple && shift != Tick::ZERO {
+        for tr in work.all_tracks_mut() {
+            if tr.locked {
+                continue;
             }
+            let member = origins.iter().find(|o| o.0 == tr.id).map(|o| o.1);
+            if member.is_none() && !tr.sync_lock {
+                continue;
+            }
+            let from = member.unwrap_or(main_from);
+            for i in &mut tr.items {
+                if !clips.contains(&i.id) && i.start >= from {
+                    // later clips must still end on the representable timeline
+                    let start = i.start.0.checked_add(shift.0).filter(|s| s.checked_add(i.duration.0).is_some());
+                    i.start = Tick(start.ok_or_else(|| EditError::Other("the speed change would move later clips past the end of the timeline".into()))?);
+                }
+            }
+            tr.sort();
         }
     }
-    if let Some(before) = before {
-        transitions_follow_cuts(&before, seq);
+    if ripple {
+        transitions_follow_cuts(seq, &mut work);
     }
+    work.check().map_err(EditError::Other)?;
+    *seq = work;
     Ok(())
 }
 

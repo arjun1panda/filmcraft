@@ -20,6 +20,10 @@ fn report_json(r: &filmcraft_interchange::Report) -> Vec<String> {
     r.entries.iter().map(|e| if e.count > 1 { format!("{} (×{})", e.message, e.count) } else { e.message.clone() }).collect()
 }
 
+fn is_file_media(item: &filmcraft_project::ProjectItem) -> bool {
+    matches!(&item.kind, ItemKind::Media(m) if matches!(m.media, MediaRef::File { .. }))
+}
+
 /// Import a document: merge its bins, media and sequences into the project (one undo step), then
 /// link each media file that exists on disk. Returns the new sequences.
 pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Result<Value> {
@@ -46,7 +50,15 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
     };
     let before: std::collections::HashSet<ItemId> = s.project.items.keys().copied().collect();
     let name = opts.name.clone().unwrap_or_else(|| format.name().to_string());
-    let seqs = s.edit(&format!("Import {name}"), |proj, _| Ok(filmcraft_interchange::merge_into(proj, fragment, None)))?;
+    let seqs = s.edit(&format!("Import {name}"), |proj, _| {
+        let seqs = filmcraft_interchange::merge_into(proj, fragment, None);
+        // A document that sets only some Motion parameters leaves the others at their "auto"
+        // (NaN) defaults. Resolve them as placing a clip does, for every format. A media file's
+        // picture size is only what the document says so far (an EDL says nothing: the importer
+        // assumes the sequence size), so its clips' anchors wait for Link Media below.
+        proj.resolve_placed_auto_points(|seq| !before.contains(&seq), |source| !is_file_media(source));
+        Ok(seqs)
+    })?;
     // Link media: probe each new file-backed item that exists.
     let new_media: Vec<(ItemId, String)> = s
         .project
@@ -85,6 +97,8 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
                             filmcraft_interchange::rebase_source_timecode(proj, id, tc, rate);
                         }
                     }
+                    // the picture size is now the file's own: centre the anchors of its clips in it
+                    proj.resolve_placed_auto_points(|seq| !before.contains(&seq), |source| source.id == id);
                     Ok(())
                 })?;
                 s.media.insert_file(id, &mpath, src);
@@ -108,15 +122,17 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
     }))
 }
 
-/// `file.exportInterchange {format: "edl"|"xml"|"fcpxml"|"otio", path, sequence?}`
+/// `file.exportInterchange {format: "edl"|"xml"|"fcpxml"|"otio"|"aaf"|"omf" = "xml", path, sequence?}`
 pub fn export(s: &mut Session, p: &Value) -> Result<Value> {
-    let format = match p.get("format").and_then(Value::as_str).unwrap_or("xml") {
-        "edl" => Format::Edl,
-        "fcpxml" => Format::Fcpxml,
-        "otio" => Format::Otio,
-        "aaf" => Format::Aaf,
-        "omf" => Format::Omf,
-        _ => Format::Fcp7Xml,
+    // FCP7 XML only when no format is asked for: a format we don't know is an error, not XML.
+    // The names are the documented ones (each format's extension, in either case) and nothing
+    // else, so the error can list exactly what is accepted.
+    let format = match p.get("format") {
+        None | Some(Value::Null) => Format::Fcp7Xml,
+        Some(v) => v.as_str().and_then(|name| Format::ALL.into_iter().find(|f| f.extension().eq_ignore_ascii_case(name))).ok_or_else(|| {
+            let names: Vec<&str> = Format::ALL.iter().map(|f| f.extension()).collect();
+            crate::commands::bad("file.exportInterchange", format!("unknown format {v}: use one of {}", names.join(", ")))
+        })?,
     };
     let path = p.get("path").and_then(Value::as_str).ok_or_else(|| EngineError::Other("need `path`".into()))?.to_string();
     let seq = p.get("sequence").and_then(Value::as_u64).map(ItemId).or(s.state.active_sequence).ok_or(EngineError::NoSequence)?;

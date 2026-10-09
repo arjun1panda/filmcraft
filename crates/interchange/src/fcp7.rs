@@ -192,6 +192,13 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         match file {
             Some(f) => {
                 let id = self.file(f, child_text(n, "name"), bin);
+                // A sequence's clip items file their media at the top level, so a sequence earlier in the
+                // document that used this file first left it there; the master clip's bin is its home.
+                if let (Some(item), Some(b)) = (id, bin)
+                    && self.b.p.root.parent_of(item) == Some(self.b.p.root.id)
+                {
+                    self.b.p.move_to_bin(&[item], Some(b));
+                }
                 if let Some(item) = id.and_then(|i| self.b.p.item_mut(i))
                     && let Some(l) = path_text(n, &["labels", "label2"]).and_then(label_from)
                 {
@@ -380,7 +387,13 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
             let label = if name.is_empty() { g.label() } else { name.clone() };
             self.b.generator_media(&key, &label, g, &spec, None)
         } else if let Some(f) = child(c, "file") {
-            self.file(f, Some(&name), None)?
+            match self.file(f, Some(&name), None) {
+                Some(item) => item,
+                None => {
+                    self.report.warn(format!("clip \"{name}\" refers to a file the document does not define; skipped"));
+                    return None;
+                }
+            }
         } else if let Some(s) = child(c, "sequence") {
             self.sequence(s, None)?
         } else {
@@ -907,6 +920,10 @@ impl Exp<'_, '_> {
         let rate = seq.settings.frame_rate;
         if !on_frame(rate, c.start) || !on_frame(rate, c.duration) {
             self.report.warn("sub-frame clip positions were rounded to frames");
+        }
+        if let Some(clip) = crate::common::uncarried_clip(self.p, c, rate) {
+            self.report
+                .warn(format!("{clip} has no Final Cut Pro 7 XML equivalent: it is written as a clip item without media and is not read back on import"));
         }
         let base = base_item(self.p, c.item);
         let generator = crate::common::generator_of(self.p, base).cloned();

@@ -480,3 +480,44 @@ fn auto_transcribe_on_import_and_transcription_defaults() {
     set(&mut s, "mediaAnalysis.whisperModel", json!("whisper-tiny"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// In a build without speech-to-text (the release builds), the transcript commands that can't
+/// run say so through `enabled` (#97, #98), and an import with auto-transcribe on reports why it
+/// made no transcript instead of saying nothing (#89).
+#[test]
+fn transcription_without_speech_to_text_says_so() {
+    let mut s = Session::default();
+    assert_eq!(s.is_enabled("transcript.generate"), crate::transcript::speech_available());
+    assert_eq!(s.is_enabled("transcript.downloadModel"), cfg!(feature = "speech-download"));
+    if crate::transcript::speech_available() {
+        return;
+    }
+    let dir = tmp_dir("prefs-no-speech");
+    let mov = dir.join("talk.mov");
+    crate::media_test_util::make_movie(&mov, filmcraft_media::DemoScene::OceanSunset, 64, 36, 24);
+    // off: an import reports nothing
+    let r = s.execute("file.import", json!({"paths": [mov.to_string_lossy()]})).unwrap();
+    assert_eq!(r["errors"], json!([]));
+    set(&mut s, "mediaAnalysis.autoTranscribe", json!(true));
+    set(&mut s, "mediaAnalysis.autoTranscribeScope", json!("allImported"));
+    let r = s.execute("file.import", json!({"paths": [mov.to_string_lossy()]})).unwrap();
+    let errors = r["errors"].as_array().unwrap();
+    assert!(errors.iter().any(|e| e.as_str().is_some_and(|e| e.starts_with("transcription:") && e.contains("not available in this build"))), "{errors:?}");
+    assert!(!s.project.transcripts.contains_key(&ItemId(r["items"][0].as_u64().unwrap())));
+    // with a transcriber installed (a host's), the command is enabled again
+    s.transcriber = Some(std::sync::Arc::new(filmcraft_speech::FixedTranscriber { transcript: Default::default(), id: "fixed".into() }));
+    assert!(s.is_enabled("transcript.generate"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hardware_decoding_setting_drives_the_decoder_switch() {
+    let mut s = Session::default();
+    assert_eq!(s.prefs.playback.hardware_decoding, "auto", "Auto by default");
+    set(&mut s, "playback.hardwareDecoding", json!("off"));
+    assert!(!filmcraft_codecs::hw::hardware_decoding(), "Off reaches the decoder registry");
+    assert!(s.execute("prefs.set", json!({"key": "playback.hardwareDecoding", "value": "gpu"})).is_err());
+    set(&mut s, "playback.hardwareDecoding", json!("auto"));
+    assert!(filmcraft_codecs::hw::hardware_decoding());
+    assert!(settings::field("playback.hardwareDecoding").is_some_and(|f| f.wired && matches!(f.kind, Kind::Choice(_))));
+}

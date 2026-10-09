@@ -1,10 +1,88 @@
 # FilmCraft Roadmap
 
-Progress toward feature parity with Adobe Premiere Pro, with estimates. Updated as milestones land.
+Progress toward parity with Adobe Premiere Pro, with estimates. Updated as milestones land.
 
-**Last updated:** 2026-10-02 · **Overall parity:** ~87% (measured scorecard below) · **Code:** 34 crates, 1605 tests
+**Last updated:** 2026-10-05 · **Feature checklist:** ~87% · **Ready for real work:** ~50–60% · **Code:** 35 crates, 1605+ tests
 
-## Parity scorecard
+Two numbers, because they answer different questions. The **feature checklist** counts whether
+Premiere's menu items, effects, panels and formats exist in FilmCraft. **Ready for real work** is
+our honest estimate of how close FilmCraft is to replacing Premiere for an editor on real
+projects: depth, correctness, robustness, speed and the pro ecosystem. The gap between the two
+is the work that matters most now. Agents: read [Where we are lacking](#where-we-are-lacking)
+before choosing work.
+
+## Honest assessment (2026-10-05)
+
+### How the checklist number is made, and what it doesn't tell you
+
+- **Partly measured.** The menu figure comes from diffing a dump of Premiere 26.5's menus against
+  `filmcraft-cli commands`. The effects, transitions and audio-effects counts are checked by unit
+  tests against Premiere's Effects panel tree (`premiere_26_video_effects_catalogue`,
+  `premiere_audio_set_is_complete_and_foldered`, `premiere_26_transition_tree`).
+- **Partly agent-reported.** The other areas' percentages are written by the agents doing the work.
+  No automated parity check runs in CI (PhotoCraft has `cargo xtask parity`; we don't yet), so
+  nothing stops a number drifting upward.
+- **Presence, not quality.** An item counts once it exists. An effect described as an
+  "approximation" counts the same as an exact one. Nothing compares our rendering with
+  Premiere's.
+- **Weights understate what users hit first.** Performance carries 5%. Plugins and AI features
+  aren't in the scorecard at all.
+
+### By dimension
+
+| Dimension | Checklist says | Honest estimate | Evidence |
+|---|---|---|---|
+| **Feature breadth** (menus, commands, panels) | ~86–95% | **~85%** | Menu diff against Premiere 26.5; effect, transition and audio-effect catalogues complete by test. The long tail is mostly there. |
+| **Correctness in depth** | not tracked | **~60–70%** | A first-time contributor found four real bugs in core paths within hours (#5–#8: AIFF import failed, Slide left linked audio behind, transitions didn't follow ripple trims, export ignored start/end times). User reports: Color Matte always grey with no picker (#29); ALSA audio error on Linux (#23). Settings are "most wired", not all. |
+| **Codecs and media** | ~90% | **~75%** | Our decoders are bit-exact on conformance streams. Real camera and phone media (variable frame rate, damaged files, unusual containers) is far less tested. No camera RAW (RED, BRAW, ARRIRAW), no E-AC-3. |
+| **Export** | ~92% | **~70%** | Delivery: H.264 only (ProRes, DNxHR and image sequences cover mastering). No HEVC or AV1 export. AAF and OMF have never been validated in Avid Media Composer or Pro Tools. Export renders and encodes on the CPU only. |
+| **Performance and hardware** | ~62% | **~35–40%** | Premiere runs effects, decoding and encoding on the GPU and the hardware media engines. Here, hardware decode works on macOS (VideoToolbox, #33; active in the desktop app only since #41, so releases up to 0.2.1 decoded in software) and Windows (Media Foundation / Direct3D 11 DXVA, H.264, HEVC Main / Main 10, VP9 and AV1 4:2:0 8/10-bit, #30). The GPU does compositing, blend modes (#32) and 31 common effects (GPU2): colour adjustments, crop/flip/transform, blurs, sharpen. Lumetri, keys, masks, the remaining effects and export rendering are CPU; H.264 encoding can use VideoToolbox on macOS (opt-in per export, no B-frames) and NVENC on Windows with an NVIDIA GPU (opt-in per export), and H.265 (HEVC) export exists there only, through the same hardware encoder. Linux has no hardware path. 8K isn't real-time (AV1 is on Windows with a hardware decoder). The effect list shows Premiere's "GPU accelerated" badge, but only 31 effect ids run on the GPU here; the rest, Lumetri included, run on the CPU. |
+| **Stability** | not tracked | **improving, unproven** | The never-crash pass (no panics in product code, last-resort guards) landed on 2026-10-04. There's no field record from real users' projects yet. |
+| **Plugins and pro ecosystem** | not tracked | **~0–10%** | No audio plugin hosting (VST3 / Audio Units) and no third-party video effects (OpenFX). For many professional editors this alone rules FilmCraft out. Team Projects and Productions are out of scope by design. |
+| **AI features** | partial | **~25–35%** | Speech to text exists but is off in default builds (the `whisper` feature). Enhance Speech is a DSP chain, not a model. Auto Reframe is approximate. No Generative Extend, and no media-intelligence search or auto colour. |
+| **Platforms** | not tracked | **macOS solid; Windows and Linux thin** | Development and testing happen on macOS. Windows and Linux are built for releases but barely exercised at runtime. The web build is a compile target; the browser app shell isn't finished. |
+| **UI fidelity** | ~85% | **~80%** | Agents compare with Premiere reference screenshots; this hasn't been checked independently. |
+
+### Where we are lacking
+
+In priority order. Agents should prefer this work over adding more checklist items.
+
+1. **Hardware acceleration** (#30), the most visible gap to users:
+   - hardware decode on Linux (VA-API);
+   - zero-copy decoded frames into wgpu;
+   - the remaining effects on the GPU: Lumetri, keys, Vignette, Video Limiter, masks (31 common effects are done);
+   - GPU export, then hardware encode: H.264 and H.265 on macOS are in (H.264 opt-in; H.265 has no other encoder), H.264 on NVENC (Windows, opt-in); HEVC on Windows and Linux remain.
+2. **A measured parity number.** Add `cargo xtask parity`, run in CI. It should cover menus,
+   commands, effects, transitions, panels, preferences and formats against the Premiere snapshot in
+   `plan/premiere/`. It should report presence and fidelity separately (exact, approximate, stub).
+3. **Real-world media corpus.** Phone, camera and screen recordings, variable frame rate, damaged
+   files, long GOPs, odd containers. Each gets an import → edit → export round-trip test with an
+   ffprobe / ffmpeg oracle.
+4. **Workflow acceptance tests.** Scripted MCP sessions that do real jobs end to end: assemble and
+   trim a scene, colour it, mix and loudness-normalise it, caption it, deliver it, round-trip
+   through XML / AAF.
+5. **Windows and Linux at runtime.** CI that runs the test suite and a headless playback/export
+   smoke test on both, not just release builds. Fix the Linux audio path (#23).
+6. **Delivery codecs.** HEVC export is in on macOS (VideoToolbox, 8-bit, no software encoder); still to do: HEVC elsewhere, 10-bit / HDR HEVC, and AV1 (`rav1e`, BSD-2).
+7. **Plugin hosting** (VST3 / Audio Units, then OpenFX). Needs FFI, so it falls under the isolated
+   `unsafe` crate rule (AGENTS.md §0.3). **Owner decision needed** before starting.
+8. **AI features** with openly licensed local models: transcription on by default, text-based
+   editing, speech enhancement, reframing.
+9. **The web app shell**: file access, WebCodecs, audio.
+
+### Where we're going
+
+**Next:** close items 1–5. Hardware acceleration fixes the gap users notice first (CPU-bound 4K playback and export). The
+parity tool, media corpus and workflow tests make the progress number trustworthy. Windows and
+Linux CI makes "runs everywhere" true.
+
+**After that:** delivery codecs, plugin hosting (pending the owner's decision) and AI features,
+measured with the same tools.
+
+**Goal:** "ready for real work" at 85%+, measured rather than estimated, on all three desktop
+platforms.
+
+## Feature checklist scorecard
 
 Measured against Premiere Pro 26.5 on this machine. Menu items: the native menu bar dump, minus
 Adobe-cloud-only items (Team Projects, Productions, Firefly, Stock, Dynamic Link, account/help pages),
@@ -22,10 +100,13 @@ matched against `filmcraft-cli commands` and the UI command table. Effects: the 
 | Graphics and captions | 8% | text engine, shapes, per-character styles, our own graphics templates (.fcgt, 8 built-ins, export/install/edit), rolls/crawls, responsive pins + time, captions SRT/VTT/SCC/MCC/STL/TTML/DFXP, transcripts | ~85% |
 | Export | 8% | own H.264/AAC, ProRes, DNxHR, MXF OP1a/OP-Atom, image sequences, GIF, WAV, 5.1; preset library + user presets, full Export-mode settings, queue, Quick Export; AAF (Edit Protocol) import/export, OMF 2.0 export; no AAF/OMF validation against Avid/Pro Tools yet | ~92% |
 | Preferences and project management | 5% | Settings dialog with 16 categories (most settings wired), project settings, scratch disks, search bins, templates | ~80% |
-| Performance | 5% | 1080p real-time, 3×1080p; 4K H.264 real-time at load ≤140 (−23% decoder cycles, opt-in draft decoding at 1/2–1/4); HEVC 2.5× cheaper, catch-up decoding, `cargo xtask bench` + `perf.stats`; 8K and AV1 not yet real-time on a loaded machine | ~62% |
+| Performance | 5% | 1080p real-time, 3×1080p; 4K H.264 real-time at load ≤140 (−23% decoder cycles, opt-in draft decoding at 1/2–1/4); HEVC 2.5× cheaper, catch-up decoding, `cargo xtask bench` + `perf.stats`; blend modes on the GPU (#32); 8K and AV1 not yet real-time on a loaded machine; no hardware path on Linux, and on Windows only decode and opt-in NVENC H.264 export (see the honest assessment: ~35–40% against Premiere) | ~62% |
 | **Weighted total** | | | **~87%** |
 
 ## Estimate to parity
+
+This estimate is for the **feature checklist**. Closing the honest-assessment gaps (above) is the
+"Robust on real-world material" row, plus plugins and AI features, which it doesn't include.
 
 Measured throughput in the last work block (2026-10-01 night → 10-02): five Opus 5.5 agents in
 parallel for ~4.5 wall-clock hours (~18 agent-hours including integration) moved parity by ~4 points
@@ -62,7 +143,7 @@ Status: ✅ done · 🟡 in progress · ⬜ not started. Estimates are remaining
 | M2 | H.264 decoder | ✅ | Own decoder, bit-exact on 37+ streams, 500–600 fps 1080p | — | — |
 | M3 | Editing core | 🟡 | Edit algebra (insert/overwrite/razor/lift/extract/ripple/roll/slip/slide/rate-stretch/nest/paste), tools, markers, trim mode + Trim Monitor + dynamic J/K/L trimming, Keyboard Shortcuts editor with FilmCraft/Premiere/FCP/Avid presets; Edit/Clip/File menu commands (Label colours and Select Label Group, Paste/Remove Attributes, Select All Matching, Remove Unused, Consolidate Duplicates, Sequence From Clip, Bin From Selection, Offline File, Close Project, Make/Edit Subclip, Modify Audio Channels/Timecode, Frame Hold Options/Add Frame Hold/Insert Frame Hold Segment, Time Interpolation with frame blending, Fit/Fill frame, Breakout to Mono, Extract Audio, Replace With Clip; M3.11: Scene Edit Detection (pure-Rust cut detection, background job), Normalize Mix Track, Simplify Sequence, Transcribe Sequence, Find/Find Next and search bins, Automate to Sequence, Edit Original, Edit Offline, Source Settings, Update Metadata (XMP), Generate Audio Waveform, Project Settings General/Scratch Disks, Get Media File Properties, Save as Template, Selection as FilmCraft Project, Avid Log Exchange export, Flash Cue markers, Dynamic Audio Waveforms, Reveal Log Files, System Compatibility Report); M3.12 keyboard parity: Premiere's default keyboard (~115 keyboard-only commands: edit-point navigation on targeted/any track, select clip at playhead/next/previous, extend edit to playhead, nudge/slip/slide selection, target and source-patch toggles, clip volume ±1 dB/many, frame maximize/full screen/panel cycling, monitor zoom, track heights, Project and Text panel keyboard navigation, text size/leading/alignment, Export Frame, poster frames; see docs/keyboard.md); multicam (Create Multi-Camera Source Sequence, Multi-Camera view with live switching on 1–9, angle switching, Enable/Flatten, Edit Cameras) and sync (Synchronize, Merge Clips; In/Out/timecode/marker/audio — GCC-PHAT, sample-accurate) | Multicam paging >16 angles and grid thumbnails, optical flow (renders as frame blending), 39 Premiere default shortcuts skipped with reasons in docs/keyboard.md (Productions, AI/cloud tools, work area bar, Production/Search panels) | 6–10 |
 | M4 | Playback | 🟡 | Audio-clock master, prefetch with cancellation, J/K/L, correct dropped-frame stats, playback resolution, render bar + content-hashed render previews, App Nap opt-out; 1080p H.264 and 3 stacked 1080p streams play with 0 dropped frames | 4K under load, 8K, frame-threaded AV1 decode, reduced-resolution decode for multicam grids | 6–10 |
-| M5 | Effects, keyframes, GPU | 🟡 | ~60 CPU effects, 30 transitions, keyframes + value/velocity graphs, wgpu compositor, effect + opacity masks (ellipse/polygon/pen, feather, expansion, modes; CPU/WGSL parity), mask tracking (Lucas–Kanade + RANSAC), adjustment layers, effect presets (built-in + user, JSON import/export) | Full ~150-effect catalogue, WGSL parity for all effects and masks in the live GPU path, Warp Stabilizer, Morph Cut | 20–30 |
+| M5 | Effects, keyframes, GPU | 🟡 | All 93 Premiere 26 video effects and 84 transitions (CPU), blend modes and 31 common effects on the GPU (#32, GPU2), keyframes + value/velocity graphs, wgpu compositor, effect + opacity masks (ellipse/polygon/pen, feather, expansion, modes; CPU/WGSL parity), mask tracking (Lucas–Kanade + RANSAC), adjustment layers, effect presets (built-in + user, JSON import/export) | Effects on the GPU (in progress, #30), GPU masks in the live path, GPU export, exact Warp Stabilizer (3-D) and Morph Cut | 20–30 |
 | M6 | Export | ✅ | Own H.264 encoder (High/Main/Baseline, B-frames, VBR/CBR/2-pass) → MP4 or QuickTime + own AAC; ProRes, DNxHR, MJPEG, PNG/TIFF/BMP sequences (Premiere-style numbering), GIF, WAV, AIFF; background jobs; M6.5: Export mode parity (frame size / rate / scaling / pixel aspect, profile / level, CBR / VBR 1- and 2-pass, keyframe distance, audio codec / rate / channels / bitrate / sample size, multiplexer, burn-in or sidecar captions, image / name / timecode overlays, video limiter, loudness normalization with true-peak limiter, metadata, ranges, estimated size, summary), 24 built-in presets + user presets with favourites and import/export (Preset Manager), export queue (reorder, cancel, retry, several sequences / ranges), Quick Export; `export.*` commands and `filmcraft-cli export --preset` | Interlaced encoding, 5.1 audio, smart render, publishing destinations | 6–8 |
 | M7 | Audio | 🟡 | Mixer graph (tracks → submixes → Mix, pre/post-fader inserts and sends, latency-compensated, sample-accurate, ~6× realtime for 24 tracks × 3 effects on one core), Audio Track Mixer + Audio Clip Mixer panels, track automation (Off/Read/Latch/Touch/Write, recorded live while playing, thinned to keyframes, timeline lanes with pen editing), solo/solo-safe, channel mapping basics, peak + BS.1770 loudness meters (match ffmpeg), DSP crate with 16 clip/track effects, Audio Gain (set/adjust/normalize), Constant Power / Constant Gain / Exponential Fade, Essential Sound (types, Loudness auto-match, Repair incl. DeEss/DeReverb, Clarity, Creative, Ducking keyframes, presets; full Dialogue chain 22× realtime) | Music duration remix, ML speech enhancement, 5.1 panner and multichannel buses, voice-over record, effect editor windows (EQ curve), remaining effects (multiband, convolution reverb), clip-mixer automation recording | 6–9 |
 | M8 | Colour | 🟡 | Lumetri: basic, creative + looks, RGB & hue curves, wheels, HSL secondary, vignette, section bypass; Input LUT / Look LUT (.cube 1D/3D/shaper, .3dl; tetrahedral CPU + WGSL; project LUT library; built-in camera conversions); Colour Match (Oklab tonal-range statistics, skin protection, solved in Lumetri wheels); colour management: Rec. 709 / Rec. 2100 PQ / HLG working spaces + wide gamut, Interpret Footage colour space (S-Log3, V-Log, Canon Log 2/3, LogC3/4, Apple Log, D-Log from published specs), metadata auto-detect, BT.2390 tone mapping, gamut mapping, HDR export signalling (VUI/colr/mdcv/clli/SEI, ffprobe-verified); Lumetri Scopes: Vectorscope YUV (75/100 % targets, skin-tone line) and HLS, Histogram, Parade (RGB/YUV/RGB-White), Waveform (RGB/Luma/YC/YC no Chroma), presets, Rec. 601/709/2100, 8-bit/float/HDR (cd/m²) scales, multi-scope grid, `scopes.read` | HDR-aware Lumetri maths, macOS EDR monitors, mastering metadata → tone-map peak, D-Log M (no published formula), HSL Secondary refine | 3–5 |
@@ -73,9 +154,14 @@ Status: ✅ done · 🟡 in progress · ⬜ not started. Estimates are remaining
 
 ## Running now
 
-- Nothing; next: remaining Premiere menu items (Settings categories, Scene Edit Detection, Normalize Mix Track, OMF/AAF, Find), AV1 single-thread re-measure on an idle machine
+- **Hardware acceleration (#30):** landed: blend modes on the GPU (#32); VideoToolbox hardware decode + the `platform` FFI crate (#33); 31 common effects on the GPU (GPU2). Windows: Media Foundation / Direct3D 11 H.264 + HEVC decode (HW2) and VP9 + AV1 (HW3), NVENC H.264 export (HW4, opt-in). Next: VA-API (Linux) decode, zero-copy upload, Lumetri on the GPU.
+- **Next:** [Where we are lacking](#where-we-are-lacking) items 1–5. GPU export waits for the export-crate work (#19 and the never-crash follow-up) to land.
 
 ## Log
+
+- **2026-10-06:** 21 community PRs landed (#19, #28, #38, #39, #41–#60). Highlights: hardware decoding is now actually on in the desktop app (#41: `register()` sat inside a `log::info!` that never ran, so #33's VideoToolbox path only worked in the CLI and benchmarks); decode memory on long timelines cut sharply (frame pool, shared GOP-cache budget, positional file reads); exports are byte-identical across machines (#19); crash fix for odd track names over MCP (#44); ripple trim, ripple delete and speed changes move split-edit clips once (#56–#58); Japanese interface using an installed system font (#38; no fonts bundled); MCP annotations, resources, export progress and cancellation (#28).
+
+- **2026-10-05:** honest assessment added (checklist ~87% vs ready for real work ~50–60%). Hardware acceleration started (#30): blend modes on the GPU (#32); VideoToolbox decode + `platform` crate, the one crate allowed `unsafe` (#33). Community fixes landed: AIFF import, export start/end ranges, transitions following ripple trims, Slide moving linked audio (#5–#8).
 
 - **2026-10-04 (later):** interchange + MXF export (M11.4/M6.6): own compound-file container (`crates/cfb`), AAF Edit Protocol import/export (embedded/linked/consolidated audio, video mixdown, handles, breakout to mono), OMF 2.0 export (Bento), MXF OP1a/OP-Atom writer (DNxHR/ProRes/H.264/PCM) as export formats. 1605 tests.
 
@@ -116,3 +202,7 @@ Status: ✅ done · 🟡 in progress · ⬜ not started. Estimates are remaining
 - **2026-09-30 (midday):** HEVC decoder, Matroska/WebM demuxer and audio DSP merged; HEVC import wired; asset rules (AGENTS.md, ATTRIBUTION.md, `cargo xtask assets`); README with hero screenshot and the Craft family.
 - **2026-09-30 (late morning):** keyframe value/velocity graphs; xtask gates; H.264 MP4 export; Lumetri curves, wheels, looks, HSL secondary.
 - **2026-09-30 (early morning):** H.264 decoder, ProRes, AAC; GPU compositor; MCP; Premiere 26 visual fidelity pass.
+
+### Interface localization
+
+Edit > Language switches English/Japanese/Spanish/Portuguese (Brazilian) and persists in UI state. Commands `app.language.english`, `app.language.japanese`, `app.language.spanish` and `app.language.portuguese` are reachable through the control channel. Core native/in-window menu labels are translated; untranslated labels use English. Japanese text uses the Japanese fonts from [craft-fonts](https://github.com/storytold/craft-fonts) when FilmCraft is built with them (`CRAFT_FONTS_DIR`; all official releases, including the web build), otherwise a Japanese font already installed on the system; with neither, switching to Japanese is refused with a message. Dialog/panel translation coverage remains open. Existing vertical text support is preserved.

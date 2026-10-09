@@ -21,13 +21,13 @@ Design principles:
 
 ```text
  L6  apps/filmcraft · apps/filmcraft-cli · apps/filmcraft-web
- L5  ui-egui · automation
+ L5  ui-egui · automation · platform
  L4  engine
  L3  render · gpu · export · golden (test-only)
  L2  edit · codecs · interchange · captions · speech
  L1  frame · media · project · audio-dsp · text
  L0  foundation: time · geom · color · bitstream · testkit (dev-dependency only)
-     codecs/containers: isobmff · matroska · mxf · cfb · mpegts · ogg · h264 · h264enc · hevc · vp9 · av1 · mpeg2v · prores · dnx · aac · ac3 · opus
+     codecs/containers: isobmff · matroska · mxf · cfb · mpegts · ogg · h264 · h264enc · hevc · vp9 · av1 · mpeg2v · prores · dnx · apv · aac · ac3 · opus
 ```
 
 Crates are named `filmcraft-<dir>` (`crates/time` is `filmcraft-time`). The apps are `filmcraft`
@@ -49,6 +49,7 @@ and `filmcraft-cli`.
 | `hevc` | L0 | H.265 Main/Main 10 decoder |
 | `prores` | L0 | ProRes decoder and encoder |
 | `dnx` | L0 | DNxHD / DNxHR (SMPTE ST 2019-1 VC-3) decoder and DNxHR encoder |
+| `apv` | L0 | Advanced Professional Video (IETF RFC 9924) decoder and encoder ([README](../crates/apv/README.md)) |
 | `av1` | L0 | AV1 decoder (Main profile; bit-exact with libdav1d; see its README for the stage table) |
 | `mpeg2v` | L0 | MPEG-2 video (Main / 4:2:2 profile; frame and field pictures, dual prime) and MPEG-1 video decoder ([README](../crates/mpeg2v/README.md)) |
 | `aac` | L0 | AAC-LC decoder and encoder |
@@ -71,6 +72,7 @@ and `filmcraft-cli`.
 | `engine` | L4 | `Session`, command registry, undo history, media pool, jobs, interchange glue |
 | `ui-egui` | L5 | the egui frontend: docking, panels, timeline, monitors, playback, control-channel handlers |
 | `automation` | L5 | MCP server (`rmcp`, stdio), headless or bridged to the running app |
+| `platform` | L5 | OS media FFI only: hardware video decoding (VideoToolbox H.264 / HEVC on macOS; Media Foundation / Direct3D 11 H.264 / HEVC on Windows; a no-op elsewhere) behind `codecs::VideoDecoder`, with transparent fallback to our decoders, and hardware H.264 encoding (VideoToolbox, opt-in) and H.265 encoding (VideoToolbox, the only H.265 encoder; the format exists only where a hardware encoder does) and NVIDIA NVENC H.264 encoding (Windows, opt-in) behind `export::VideoEncoder`; H.264 declines to the built-in encoder for what the hardware does not take. The one crate allowed `unsafe` ([ADR 0001](adr/0001-platform-ffi.md), [README](../crates/platform/README.md)) |
 | `filmcraft` | L6 | desktop binary: eframe/wgpu window, cpal audio output, file dialogs, native macOS menu, TCP control server |
 | `filmcraft-cli` | L6 | headless CLI: `exec`, `run`, `inspect`, `describe`, `commands`, `import`, `export`, `render`, `probe`, `mcp`; `--bridge` targets the running app |
 | `filmcraft-web` | L6 | the browser app (wasm32): eframe web runner on WebGPU/WebGL2, Blob-backed services, OPFS recovery, WebAudio, WebCodecs, `window.filmcraft` API ([web.md](web.md)) |
@@ -91,7 +93,8 @@ are exempt):
 
 `cargo xtask wasm` runs `cargo check --target wasm32-unknown-unknown` on every L0–L4 crate, the
 egui UI and the web app, so everything up to the engine stays web-portable and the web app builds
-([web.md](web.md)). `unsafe_code = "deny"` applies workspace-wide.
+([web.md](web.md)). `unsafe_code = "forbid"` applies workspace-wide, except in `platform`
+(`deny`, allowed only on its FFI modules; [ADR 0001](adr/0001-platform-ffi.md)).
 
 ## 2. Time base
 
@@ -196,7 +199,8 @@ pub struct CommandSpec {
 
 ```text
 file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware seek
-          │   decoder registry: h264, hevc, vp9, av1, prores, dnx, mjpeg (+ any registered first)
+          │   decoder registry: h264, hevc, vp9, av1, prores, dnx, mjpeg (+ any registered first:
+          │   platform's VideoToolbox (macOS) or Media Foundation (Windows) H.264 / HEVC, falling back to ours)
           ▼
         media::MediaSource ──► frame cache (byte-budgeted LRU, shared)
           ▼
@@ -206,7 +210,7 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
           in linear-light premultiplied f32
           │
           └─ render::plan::plan_frame → gpu::GpuCompositor     GPU path
-               layers = decoded YUV/RGBA frames + matrix + opacity;
+               layers = decoded YUV/RGBA frames + matrix + opacity + blend mode;
                anything the shaders don't cover is pre-rendered on the CPU
           ▼
         ui-egui frames.rs worker pool ──► monitors (program/source), thumbnails, prefetch
@@ -225,14 +229,86 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   every frame of the GOP. Sequential playback reuses the decoder. Decoders implement
   `codecs::VideoDecoder`. `register_video_decoder` puts a factory in front of the built-in ones, so a
   hardware decoder can take precedence. The GOP cache never holds its lock while decoding.
+- **Hardware decoding.** The apps (desktop, CLI / headless MCP, bench) call
+  `filmcraft_platform::register()` at startup, which on macOS registers a VideoToolbox factory for
+  `avcC` / `hvcC` streams (8 / 10-bit, 4:2:0 and 4:2:2; elsewhere it does nothing), and on Windows a
+  Media Foundation one (below). The factory
+  declines (our decoder is used) when Settings ▸ Playback ▸ Hardware decoding is Off
+  (`codecs::hw::set_hardware_decoding`, applied by the engine whenever preferences change), for
+  formats it does not take, and when the OS cannot create a *hardware* session for the stream.
+  Its decoder is a `platform::HybridDecoder`: VideoToolbox decodes asynchronously (two access
+  units in flight), a reorder buffer of the stream's own depth (`max_num_reorder_frames` /
+  `sps_max_num_reorder_pics`, from `codecs::hw::NalStreamInfo`) restores presentation order, and
+  the decoded biplanar `CVPixelBuffer` is copied into planar `Yuv8` / `Yuv16`. Colour, pixel
+  aspect, random-access and disposable answers come from the same helpers as the software
+  decoders (`video::vui_color`, `sar_par`, `h264_disposable`, `hevc_disposable`), so the two are
+  interchangeable (bit-exact in the parity tests). If the hardware fails mid-stream (decode error,
+  session lost to a GPU change or sleep, changed in-band parameter sets), the hybrid builds
+  `codecs::software_video_decoder` (built-in factories only), replays the samples since the last
+  restart point and continues in software for that instance; it is logged and counted. A source
+  already open keeps its decoder when the setting changes, until it is reopened. `perf.stats`
+  `decode.hardware` reports hardware vs software frames, sessions, declines and fallbacks, and the
+  registered `backend`.
+  On Windows the decoder (`platform::media_foundation`) is a Direct3D-aware decoder MFT driven at
+  the level of single access units (no Source Reader: the demuxer above already delivers the
+  samples): the `avcC` / `hvcC` sample becomes Annex B, the MFT is given the process's Direct3D 11
+  video device through an `IMFDXGIDeviceManager` so it decodes with DXVA, and its NV12 (8-bit) /
+  P010 (10-bit) texture is read back through a staging texture (the one GPU to CPU copy) into
+  planar `Yuv8` / `Yuv16`. H.264 Baseline / Main / High, HEVC Main / Main 10, VP9 profiles 0 / 2 and AV1 main
+  (8- and 10-bit), 4:2:0, progressive (VP9 / AV1 samples go in as they are, not as Annex B);
+  everything else, and any stream the GPU's DXVA decoder does not list, is declined. A decoder that
+  would hand back system-memory pictures (Microsoft's decoder MFTs do that when DXVA is not
+  available) fails the stream, so the hybrid continues with our decoder and Windows' software
+  decoding is never used in its place. Zero-copy (the texture straight to wgpu) is not done yet.
   Decoders run slices on rayon, so an export worker waiting inside a decode can pick up another
   frame of the same source. A request that finds the shared decoder busy decodes with a private
   decoder.
+- **Hardware encoding.** On Windows, `platform::nvenc::export::factory` is registered with
+  `filmcraft_export::register_encoder` (`register()` does this once), in front of the software H.264
+  encoder. It takes an export only when Export ▸ Hardware encoding (`ExportSettings.hardwareEncoding`,
+  `HardwareEncoding::Auto`) is Auto, which is off by default: hardware streams differ from ours, and
+  exports are otherwise byte-identical from run to run. NVENC (`platform::nvenc`, the driver's
+  `nvEncodeAPI64.dll` loaded at run time) then takes RGBA frames, converted to 4:2:0 by the software
+  encoder's own conversion, and produces the H.264 samples and `avcC` of an MP4 / MOV. It declines
+  (the software encoder runs, counted in `export.hardware.declined`) two-pass VBR, HDR, MXF,
+  interlaced output, sizes outside NVENC's limits, and systems without an NVIDIA GPU or driver.
+  A failure during an export ends it with an error: the software encoder cannot take over a hardware
+  stream.
 - **Compositor.** `render` is the reference for monitors, thumbnails and export. `render::plan`
-  turns a frame into GPU layers. Non-Normal blend modes, standard effects, adjustment layers, nested
-  sequences and non-dissolve transitions are rendered on the CPU for that layer or frame and handed to
-  the GPU as an image, so both paths give the same picture. Setting `FILMCRAFT_CPU_COMPOSITE=1`
+  turns a frame into GPU layers, each with its opacity and blend mode. All 27 blend modes run on the
+  GPU (`filmcraft-gpu`): Normal and Dissolve with fixed-function "over" blending, the others by
+  copying the accumulator under the layer into a backdrop texture and compositing in the fragment
+  shader with the CPU reference's formulas. The common standard effects run on the GPU too
+  (`render::gpufx`, `gpu::fx`): Brightness & Contrast, ProcAmp, Tint, Black & White, Color
+  Balance, Leave Color, Change to Color, Color Pass, Color Replace, Channel Mix, ASC CDL, Gamma
+  Correction, Levels, Extract, Invert, Posterize, Alpha Adjust, Gaussian Blur and Directional Blur
+  (and their legacy aliases), Camera Blur, Sharpen, Unsharp Mask, Crop, Edge Feather, Transform,
+  Horizontal / Vertical Flip, Mirror and Offset. When every enabled effect of a media clip is in
+  that set (unmasked, with finite parameters, and no Transform shrinking the picture below half
+  size, which the CPU pre-filters), the plan hands the GPU the clip's source with
+  the effects' parameters evaluated at that time: the source is drawn into an `Rgba32Float`
+  working image at the size the CPU decodes it, each effect runs as compute passes with the CPU
+  reference's math (effects, then Motion, then Opacity / blend, as on the CPU), and the result is
+  placed like any layer. Other standard effects, effect and opacity masks, adjustment layers,
+  nested sequences (except a plain one, whose own layers go into the plan: same frame size and
+  colour settings as its parent, nothing on the clip that changes the picture, every layer inside
+  blended normally) and non-dissolve transitions are rendered on the CPU for that layer or frame
+  and handed to the GPU as an image (a layer image keeps its clip's blend mode), so both paths
+  give the same picture. Setting `FILMCRAFT_CPU_COMPOSITE=1`
   forces the CPU path in the desktop app.
+- **CPU compositor shortcuts.** The CPU compositor, which is what export runs, works on
+  premultiplied linear `f32` images, 33 MB at 1080p, so what it does not allocate, convert or mix
+  is time saved. Three shortcuts, each of which gives the general path's bits (compared bit for
+  bit, with every blend mode, in `render/src/region_tests.rs`): the canvas stays unallocated
+  until a layer needs it, and an opaque bottom layer (an 8-bit or 16-bit Y'CbCr frame without an
+  alpha plane, opacity 100 %, Normal) simply becomes the canvas; a plain media frame with an alpha
+  plane (a ProRes 4444 banner) is converted and mixed only inside the rectangle where its alpha is
+  not zero (`VideoFrame::alpha_region`, `to_linear_f32_region`, `blend::composite_at`), the rest
+  being transparent anyway; and working images are recycled through `filmcraft_frame::pool`
+  (`take_f32_overwritten` / `recycle_f32`: the buffer comes back with its old contents, so there is
+  no zero-fill) by the export pipeline once a frame is converted to 8 bits. A clip with effects,
+  opacity masks, frame blending, colour management, or a picture that is not placed one to one on
+  the output takes the general path.
 - **Frame scheduling.** `crates/ui-egui/src/frames.rs` runs a small pool of worker threads with
   prioritised jobs: the frame on screen first, then playback prefetch, then thumbnails. The UI never
   decodes. It shows the exact frame when it is ready and holds the nearest cached frame meanwhile.
@@ -565,6 +641,11 @@ file.exportMedia {path, preset?, settings?, format?, range?, …}     export.qui
 | `png`, `tiff`, `bmp` | `image` | numbered stills `<name>000.<ext>`, `<name>001.<ext>` … |
 | `gif`, `wav`, `aiff` | built in / `image` | GIF / RIFF WAVE (`WAVE_FORMAT_EXTENSIBLE` for 5.1) / AIFF (16- or 24-bit PCM) |
 
+- **Reproducible.** The same project and settings give the same file on every machine. Frames render
+  in batches of one per core, but the muxer gets them in fixed groups of 16 output frames
+  (`INTERLEAVE` in `crates/export/src/job.rs`), each followed by its audio, and H.264 uses one slice
+  per four macroblock rows instead of one per core. MXF files are the exception: their UMIDs and
+  modification date come from the clock, as SMPTE ST 330 / ST 377 expect.
 - **Settings.** `ExportSettings` (serde, camelCase, every field optional) holds Video (frame size or
   Match Source, frame rate, Scale to Fit / Fill / Stretch, pixel aspect, field order — progressive
   only, profile / level, bitrate encoding, target / maximum / adaptive bitrate, keyframe distance,
@@ -588,11 +669,16 @@ Video encoders implement `export::VideoEncoder`. Codec crates plug in with `regi
 Timelines can be exchanged as EDL, FCP7 XML, FCPXML, OTIO, AAF or OMF. `file.import` detects these
 formats and merges the result into the project as one undoable step (AAF / OMF embedded audio is
 written next to the document first), and `file.exportInterchange`, `file.exportEdl`,
-`file.exportFcpxml`, `file.exportOtio`, `file.exportAaf` and `file.exportOmf` write them. For AAF and
+`file.exportFcpxml`, `file.exportOtio`, `file.exportAaf` and `file.exportOmf` write them.
+`file.exportInterchange {format}` takes `edl`, `xml` (the default), `fcpxml`, `otio`, `aaf` or `omf`;
+any other value is a parameter error and nothing is written. For AAF and
 OMF the engine (`engine::aaf_omf`) first prepares the audio the document references: it lists the
 used ranges (`interchange::essence::audio_needs`), decodes or renders them (clip effects through the
 export audio pipeline), embeds them or writes WAV / AIFF files, and optionally renders a video
-mixdown.
+mixdown. A nested sequence is exported the way Premiere Pro does it: a composition of its own in
+AAF (the media of the clips inside it is prepared with the rest), its sound mixed into the document
+in OMF, a nested sequence in FCP7 XML, FCPXML and OTIO, and one `AX` event in an EDL (table in the
+[interchange README](../crates/interchange/README.md)).
 
 ## 7. Automation surfaces
 
@@ -636,7 +722,8 @@ Protocol reference: [control-protocol.md](control-protocol.md). Agent guide: [ag
 ## 8. Not built yet
 
 The layer table reserves names for crates that don't exist yet: `riff`, `mjpeg`,
-`keyframe`, `effects`, `audio`, `playback` and `platform`.
+`keyframe`, `effects`, `audio` and `playback`. (`platform` exists but holds only OS media FFI;
+other OS integration stays in `apps/filmcraft`.)
 Until they exist, that work lives elsewhere: keyframes and effect definitions in `project`, effects
 and the audio mix in `render`, playback in `ui-egui`, and OS integration (cpal, rfd,
 native menus) in `apps/filmcraft`. [ROADMAP.md](../ROADMAP.md) has the milestone status.
